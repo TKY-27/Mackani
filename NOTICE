@@ -1,0 +1,35 @@
+Mackani
+Copyright 2026 TKY-27 (https://github.com/TKY-27)
+
+Mackani is an unofficial port of YASAKANI.
+YASAKANI: Copyright 2026 the YASAKANI authors, Apache License 2.0.
+https://github.com/yasakani-dev/yasakani
+
+The specification under docs/spec/, the format document copied from upstream,
+and the test fixtures listed in THIRD_PARTY_NOTICES.md are derived from
+YASAKANI source at commit 758ef28. The loop guard is ported from upstream's
+Python implementation. The Rust engine was written from the behaviour
+specification without copying upstream engine code.
+
+Model files distributed separately by the YASAKANI authors
+--------------------------------------------------------
+The model files are distributed by the YASAKANI authors in two model folders
+(the quality model and the fastest model), not with Mackani.
+
+* qwen38_27b_quality.yskn (quality model) and qwen38_27b_speed.yskn (fastest model) are derived from Qwen3.8-27B, published
+  by the Qwen team (Alibaba Cloud) under the Apache License 2.0. They are NOT the original weights: each was converted to the
+  YASAKANI file format and compressed (quantized), so the numbers stored in it differ from the original model, and its
+  behaviour, accuracy and speed differ accordingly.
+* bdraft2_k8.yskn and bdraft2_k8.shead (the small draft model that proposes next tokens; the same two files are in both model
+  folders) are derived from the DFlash 2 draft model for Qwen3.8-27B published by z-lab (a mirror of
+  incoai/Qwen3.8-27B-DFlash2, credited to Inco AI), whose Hugging Face page lists the Apache License 2.0. They were converted to
+  the YASAKANI file format, compressed (quantized) and re-trained by the YASAKANI authors against a compressed Qwen3.8-27B model
+  (an earlier YASAKANI conversion). They are NOT the original weights.
+
+Third-party software and model attributions are listed in
+THIRD_PARTY_NOTICES.md.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not
+use this software except in compliance with the License. You may obtain a
+copy of the License in the file LICENSE or at
+http://www.apache.org/licenses/LICENSE-2.0

@@ -1,0 +1,645 @@
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn metal_matches_scalar_reference() {
+    println!("skipped: no Metal device (not macOS)");
+}
+
+#[cfg(target_os = "macos")]
+mod fixture;
+// Shared writer retains mackani-ref's Rust 1.85 syntax.
+#[cfg(target_os = "macos")]
+#[allow(dead_code, clippy::manual_is_multiple_of)]
+#[path = "../../mackani-ref/tests/support/mod.rs"]
+mod support;
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use super::fixture::{DATA_OFFSET, TempFile, assert_sums, change_header, random, synthetic};
+    use super::support;
+    use mackani_engine::MetalEngine;
+    use mackani_engine::{Engine, Kernel, MappedModel};
+    use mackani_format::Container;
+    use mackani_ref::compressed_linear::CompressedLinear;
+    use serde_json::json;
+
+    /// A missing device is reported on stdout and is the only way to skip.
+    fn engine() -> Option<MetalEngine> {
+        let engine = MetalEngine::new().unwrap();
+        if engine.is_none() {
+            println!("skipped: no Metal device");
+        }
+        engine
+    }
+
+    fn reference_sums(
+        reference: &CompressedLinear,
+        activation: &[i8],
+        scales: &[i32],
+        n: usize,
+    ) -> Vec<i64> {
+        let k = reference.cols();
+        let groups = k / 512;
+        (0..activation.len() / k)
+            .flat_map(|m| {
+                reference
+                    .weighted_sums(
+                        &activation[m * k..(m + 1) * k],
+                        &scales[m * groups..(m + 1) * groups],
+                        n,
+                    )
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn metal_matches_scalar_reference_for_layouts_bits_shapes_and_batches() {
+        let Some(mut engine) = engine() else { return };
+        for bits in 4..=8 {
+            for layout in ["row", "warp"] {
+                let mut shapes = vec![
+                    (17, 32, 512),
+                    (65, 96, 1024),
+                    (17, 32, 5120),
+                    (13, 16, 512),
+                    (100, 128, 1024),
+                ];
+                if layout == "row" {
+                    shapes.push((9, 11, 512));
+                }
+                for (rows, physical_rows, cols) in shapes {
+                    let bytes = synthetic(bits, layout, rows, physical_rows, cols, false);
+                    let file = TempFile::new(&bytes);
+                    // SAFETY: the private file is never changed while this model,
+                    // its matrix, or the engine's no-copy buffer exists; the guard
+                    // is declared first, so it is dropped (and the file removed) last.
+                    let model = unsafe { MappedModel::open(&file.0) }.unwrap();
+                    let matrix = model.matrix("linear").unwrap();
+                    let mut reader = Container::from_bytes(bytes).unwrap();
+                    let reference =
+                        CompressedLinear::new(reader.load_tensor("linear").unwrap(), false)
+                            .unwrap();
+                    let groups = cols / 512;
+                    let mut seed = 0x51ab_9001_7c3e_d24f ^ (bits as u64 * 131 + cols as u64);
+                    // Extreme rows first: all +127, all -127, all -128, zero, alternating.
+                    let activation: Vec<i8> = (0..40)
+                        .flat_map(|m| {
+                            let mut row: Vec<i8> = match m {
+                                0 => vec![127; cols],
+                                1 => vec![-127; cols],
+                                2 => vec![-128; cols],
+                                3 => vec![0; cols],
+                                4 => (0..cols)
+                                    .map(|c| if c % 2 == 0 { 127 } else { -128 })
+                                    .collect(),
+                                _ => (0..cols).map(|_| random(&mut seed) as i8).collect(),
+                            };
+                            if m > 4 {
+                                row[0] = m as i8;
+                            }
+                            row
+                        })
+                        .collect();
+                    let scales: Vec<i32> = (0..40)
+                        .flat_map(|m| {
+                            let mut row: Vec<i32> =
+                                (0..groups).map(|_| random(&mut seed) as i32).collect();
+                            match m {
+                                0 => row.fill(i32::MAX),
+                                2 => row.fill(i32::MIN),
+                                _ => row[0] = (row[0] & !63) | m,
+                            }
+                            row
+                        })
+                        .collect();
+                    let expected = reference_sums(&reference, &activation, &scales, physical_rows);
+                    assert!(
+                        expected[physical_rows..2 * physical_rows]
+                            .iter()
+                            .any(|&s| s != 0)
+                    );
+                    assert!(
+                        expected[3 * physical_rows..4 * physical_rows]
+                            .iter()
+                            .all(|&s| s == 0)
+                    );
+
+                    let mut jobs = Vec::new();
+                    for m in [1, 2, 3, 8, 16, 17, 40] {
+                        let context =
+                            format!("{layout} bits={bits} K={cols} N={rows}/{physical_rows} M={m}");
+                        let result = engine
+                            .weighted_sums(&matrix, &activation[..m * cols], &scales[..m * groups])
+                            .unwrap();
+                        assert_sums(&result, &expected[..m * physical_rows], &context);
+                        jobs.push(
+                            engine
+                                .job(
+                                    &matrix,
+                                    &activation[..m * cols],
+                                    &scales[..m * groups],
+                                    physical_rows,
+                                )
+                                .unwrap(),
+                        );
+                        if m == 3 {
+                            for n in [1, rows, physical_rows - 1] {
+                                let prefix: Vec<_> = (0..m)
+                                    .flat_map(|i| {
+                                        expected[i * physical_rows..i * physical_rows + n]
+                                            .iter()
+                                            .copied()
+                                    })
+                                    .collect();
+                                let result = engine
+                                    .weighted_sums_prefix(
+                                        &matrix,
+                                        &activation[..m * cols],
+                                        &scales[..m * groups],
+                                        n,
+                                    )
+                                    .unwrap();
+                                assert_sums(&result, &prefix, &format!("{context} prefix={n}"));
+                            }
+                        }
+                    }
+                    // All M variants again, encoded into one command buffer.
+                    engine.run(&mut jobs).unwrap();
+                    for job in &jobs {
+                        let m = job.output().len() / physical_rows;
+                        assert_sums(
+                            &job.output(),
+                            &expected[..m * physical_rows],
+                            &format!("batched {layout} bits={bits} K={cols} M={m}"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// All weights ±127 with activations at -128/+127 and |scales| up to 2^31, at one
+    /// group and at the maximum of 512 groups (1024 sequences): the largest partial
+    /// sums either kernel can see. Both multiply-accumulate modes must equal the
+    /// CPU kernel.
+    #[test]
+    fn extreme_values_at_maximum_sequence_counts_match_cpu_kernel() {
+        let Some(mut engine) = engine() else { return };
+        let mut cpu = Engine::new(Kernel::fastest(), 4).unwrap();
+        let mut seed = 0x0e57_7a11_c0de_0127_u64;
+        for bits in 4..=8 {
+            for layout in ["row", "warp"] {
+                for (cols, signs) in [(512, false), (512, true), (262_144, false), (262_144, true)]
+                {
+                    let mut bytes = synthetic(bits, layout, 32, 32, cols, false);
+                    let header_length =
+                        u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+                    let header: serde_json::Value =
+                        serde_json::from_slice(&bytes[32..32 + header_length]).unwrap();
+                    let table = header["tensors"][0]["lut_off"].as_u64().unwrap() as usize;
+                    // Each entry ±1.0: every weight quantizes to ±127 (all +127 unless `signs`).
+                    for pair in bytes[table..table + 16_384].as_chunks_mut::<2>().0 {
+                        let negative = signs && !random(&mut seed).is_multiple_of(2);
+                        *pair = mackani_format::f32_to_f16(if negative { -1.0 } else { 1.0 })
+                            .to_le_bytes();
+                    }
+                    let file = TempFile::new(&bytes);
+                    // SAFETY: the private file is never modified and outlives all mapping owners.
+                    let model = unsafe { MappedModel::open(&file.0) }.unwrap();
+                    let matrix = model.matrix("linear").unwrap();
+                    let groups = cols / 512;
+                    let m = 17;
+                    let activation: Vec<i8> = (0..m)
+                        .flat_map(|row| {
+                            let mut seed = seed ^ row as u64;
+                            (0..cols).map(move |c| match row {
+                                0 | 1 => -128,
+                                2 => 127,
+                                3 => {
+                                    if c % 2 == 0 {
+                                        -128
+                                    } else {
+                                        127
+                                    }
+                                }
+                                4..=9 => {
+                                    if random(&mut seed).is_multiple_of(2) {
+                                        -128
+                                    } else {
+                                        127
+                                    }
+                                }
+                                _ => random(&mut seed) as i8,
+                            })
+                        })
+                        .collect();
+                    let scales: Vec<i32> = (0..m)
+                        .flat_map(|row| {
+                            let mut seed = seed ^ (row as u64) << 32;
+                            (0..groups).map(move |_| match row {
+                                0 | 2 => i32::MAX,
+                                1 | 3 => i32::MIN,
+                                _ => random(&mut seed) as i32,
+                            })
+                        })
+                        .collect();
+                    seed = seed.wrapping_add(1);
+                    let expected = cpu.weighted_sums(&matrix, &activation, &scales).unwrap();
+                    // All +127: row 1 reaches the bound 512 * 127 * 128 * 2^31 per group
+                    // (99.2 % of the i64 limit at 512 groups).
+                    let largest = expected.iter().map(|s| s.unsigned_abs()).max().unwrap();
+                    assert!(signs || largest == (groups as u64 * 512 * 127 * 128) << 31);
+
+                    for rows in [1, 5, 16, 17] {
+                        let result = engine
+                            .weighted_sums(
+                                &matrix,
+                                &activation[..rows * cols],
+                                &scales[..rows * groups],
+                            )
+                            .unwrap();
+                        assert_sums(
+                            &result,
+                            &expected[..rows * 32],
+                            &format!("{layout} bits={bits} K={cols} signs={signs} M={rows}"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Rows shared between the GPU and the CPU kernel (several matrices per call,
+    /// padded and partial tiles) equal the GPU-only and CPU-only sums, in both
+    /// multiply-accumulate modes. Physical N = 11 and 32 are below the 64 rows
+    /// at which the CPU gets a whole 32-row tile, so the GPU must compute all of
+    /// them at every share (unit tests in `src/metal.rs` assert the zero CPU
+    /// rows and that a CPU part is then never called, and cover reuse after a
+    /// failing CPU part); 75 and 104 are not multiples of 32. There is no prefix
+    /// variant of the split: it always covers every physical row.
+    #[test]
+    fn cpu_and_gpu_row_split_matches_either_device_alone() {
+        let Some(mut engine) = engine() else { return };
+        let mut cpu = Engine::new(Kernel::fastest(), 4).unwrap();
+        let shapes = [
+            (300, 320, "warp", 6),
+            (70, 75, "row", 5),
+            (17, 32, "row", 8),
+            (9, 11, "row", 4),
+            (100, 104, "warp", 7),
+        ];
+        let files: Vec<_> = shapes
+            .iter()
+            .map(|&(rows, physical, layout, bits)| {
+                TempFile::new(&synthetic(bits, layout, rows, physical, 5120, false))
+            })
+            .collect();
+        // SAFETY: the private files are never modified and outlive all mapping owners.
+        let models: Vec<_> = files
+            .iter()
+            .map(|file| unsafe { MappedModel::open(&file.0) }.unwrap())
+            .collect();
+        let matrices: Vec<_> = models.iter().map(|m| m.matrix("linear").unwrap()).collect();
+        let refs: Vec<_> = matrices.iter().collect();
+        let mut seed = 0x5917_c0de_0000_0001;
+        for m in [1, 3, 16, 20] {
+            let activation: Vec<i8> = (0..m * 5120).map(|_| random(&mut seed) as i8).collect();
+            let scales: Vec<i32> = (0..m * 10).map(|_| random(&mut seed) as i32).collect();
+            let expected: Vec<_> = matrices
+                .iter()
+                .map(|matrix| cpu.weighted_sums(matrix, &activation, &scales).unwrap())
+                .collect();
+
+            for share in [None, Some(0.0), Some(0.3), Some(0.9)] {
+                engine.set_cpu_share(share).unwrap();
+                let split = engine
+                    .weighted_sums_split(&mut cpu, &refs, &activation, &scales)
+                    .unwrap();
+                let gpu = engine
+                    .weighted_sums_shared(&refs, &activation, &scales)
+                    .unwrap();
+                for (i, expected) in expected.iter().enumerate() {
+                    let context = format!("matrix={i} M={m} share={share:?}");
+                    assert_sums(&split[i], expected, &format!("split {context}"));
+                    assert_sums(&gpu[i], expected, &format!("gpu {context}"));
+                }
+            }
+        }
+        assert!(engine.set_cpu_share(Some(0.95)).is_err());
+        assert!(engine.set_cpu_share(Some(-0.1)).is_err());
+        engine.set_cpu_share(Some(0.5)).unwrap();
+        assert_eq!(engine.cpu_share(1, 3), 0.5);
+        engine.set_cpu_share(Some(0.0)).unwrap();
+        assert_eq!(engine.cpu_share(16, 10), 0.0);
+        engine.set_cpu_share(None).unwrap();
+        // Auto is the calibrated table only on the measured machine (Apple M5,
+        // 4+6 CPU cores, 10 GPU cores, 10 CPU workers), off elsewhere.
+        assert_eq!(engine.cpu_share(16, 4), 0.0);
+        let calibrated: Vec<_> = [1, 2, 3, 4, 8, 12, 16, 40]
+            .map(|m| engine.cpu_share(m, 10))
+            .to_vec();
+        let table = if engine.share_table_applies(10) {
+            [0.08, 0.08, 0.085, 0.09, 0.12, 0.135, 0.15, 0.15]
+        } else {
+            [0.0; 8]
+        };
+        assert!(
+            calibrated
+                .iter()
+                .zip(table)
+                .all(|(a, b)| (a - b).abs() < 1e-12)
+        );
+    }
+
+    /// Every compressed matrix of a synthetic model file, through the no-copy
+    /// code buffers of an engine whose buffer limit is forced below the file
+    /// size, so the mapping is wrapped in several buffers: the sums equal the
+    /// CPU kernel's, and a limit below one code stream is a clear error.
+    #[test]
+    fn mapping_larger_than_the_buffer_limit_is_wrapped_in_several_buffers() {
+        if engine().is_none() {
+            return;
+        }
+        let file = TempFile::new(&support::synthetic_model(
+            107,
+            &["linear_attention", "full_attention", "linear_attention"],
+        ));
+        // SAFETY: the private file is never modified and outlives all mapping owners.
+        let model = unsafe { MappedModel::open(&file.0) }.unwrap();
+        let matrices: Vec<_> = model
+            .header()
+            .tensors
+            .iter()
+            .filter(|t| t.role != mackani_format::Role::Embedding)
+            .map(|t| model.matrix(&t.name).unwrap())
+            .collect();
+        assert!(matrices.len() > 4);
+        let page = mackani_engine::Machine::detect().page_size.unwrap() as usize;
+        let longest = matrices.iter().map(|m| m.code_range().len()).max().unwrap();
+        let limit = longest.next_multiple_of(page) + page;
+        let file_length = std::fs::metadata(&file.0).unwrap().len() as usize;
+        assert!(limit < file_length, "limit {limit}, file {file_length}");
+        let mut cpu = Engine::new(Kernel::fastest(), 2).unwrap();
+        let mut small = MetalEngine::with_limits(Some(limit), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(small.max_buffer_length(), limit);
+        let mut seed = 0x6b0f_fe75_0000_0003;
+        for (index, matrix) in matrices.iter().enumerate() {
+            let k = matrix.descriptor().cols;
+            let m = 3;
+            let activation: Vec<i8> = (0..m * k).map(|_| random(&mut seed) as i8).collect();
+            let scales: Vec<i32> = (0..m * k / 512).map(|_| random(&mut seed) as i32).collect();
+            let expected = cpu.weighted_sums(matrix, &activation, &scales).unwrap();
+            let sums = small.weighted_sums(matrix, &activation, &scales).unwrap();
+            assert_sums(&sums, &expected, &format!("matrix {index}"));
+            let split = small
+                .weighted_sums_split(&mut cpu, &[matrix], &activation, &scales)
+                .unwrap();
+            assert_sums(&split[0], &expected, &format!("split matrix {index}"));
+        }
+        assert!(small.code_buffers() > 1, "{} buffers", small.code_buffers());
+        let mut tiny = MetalEngine::with_limits(Some(page), None).unwrap().unwrap();
+        let matrix = matrices
+            .iter()
+            .find(|m| m.code_range().len() > page)
+            .unwrap();
+        let k = matrix.descriptor().cols;
+        let error = tiny
+            .weighted_sums(matrix, &vec![1; k], &vec![1; k / 512])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not fit maxBufferLength"), "{error}");
+    }
+
+    /// Regression for the several-buffer path, in one sparse file larger than
+    /// 4 GiB whose three streams all lie above 4 GiB: `a` page-aligned, `b`
+    /// unaligned (shift 1) and crossing the end of the window created for
+    /// `a`, `c` unaligned (shift 3) and ending at the end of the file, which is
+    /// not a page multiple, so its window is cut at the mapping's last page.
+    /// Each gets its own window; the sums equal the CPU kernel's, in either order.
+    #[test]
+    fn windows_cover_unaligned_streams_a_window_end_inside_a_stream_and_the_file_end() {
+        use std::os::unix::fs::FileExt;
+        if engine().is_none() {
+            return;
+        }
+        let page = mackani_engine::Machine::detect().page_size.unwrap();
+        let template = synthetic(5, "row", 320, 320, 512, false);
+        let length = u64::from_le_bytes(template[8..16].try_into().unwrap()) as usize;
+        let header: serde_json::Value = serde_json::from_slice(&template[32..32 + length]).unwrap();
+        let tensor = &header["tensors"][0];
+        let stream = tensor["stream_bytes"].as_u64().unwrap();
+        let (table, scales) = (
+            tensor["lut_off"].as_u64().unwrap() as usize,
+            tensor["scale_off"].as_u64().unwrap() as usize,
+        );
+        let base = (1_u64 << 32) + page;
+        let starts = [base, base + stream + 1, base + 2 * stream + 3];
+        let file_bytes = starts[2] + stream;
+        assert_ne!(file_bytes % page, 0);
+        // The limit holds one stream plus a page, so `a`'s window ends inside `b`.
+        let limit = stream.next_multiple_of(page) + page;
+        assert!(starts[1] < base + limit && base + limit < starts[1] + stream);
+        // Small part: header, then each tensor's table and scales.
+        let mut bytes = template[..DATA_OFFSET].to_vec();
+        let mut tensors = Vec::new();
+        for (name, &start) in ["a", "b", "c"].iter().zip(&starts) {
+            let lut = bytes.len();
+            bytes.extend_from_slice(&template[table..]);
+            let mut entry = tensor.clone();
+            entry["name"] = json!(name);
+            entry["stream_off"] = json!(start);
+            entry["lut_off"] = json!(lut);
+            entry["scale_off"] = json!(lut + scales - table);
+            tensors.push(entry);
+        }
+        bytes[24..32].copy_from_slice(&file_bytes.to_le_bytes());
+        let mut header = header.clone();
+        header["tensors"] = json!(tensors);
+        super::fixture::replace_header(&mut bytes, header);
+        let file = TempFile::new(&bytes);
+        let handle = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file.0)
+            .unwrap();
+        handle.set_len(file_bytes).unwrap();
+        let mut seed = 0x51ce_0b0f_0000_0007;
+        for &start in &starts {
+            let codes: Vec<u8> = (0..stream).map(|_| random(&mut seed) as u8).collect();
+            handle.write_all_at(&codes, start).unwrap();
+        }
+        drop(handle);
+        // SAFETY: the private file is never modified and outlives all mapping owners.
+        let model = unsafe { MappedModel::open(&file.0) }.unwrap();
+        let matrices: Vec<_> = ["a", "b", "c"]
+            .map(|name| model.matrix(name).unwrap())
+            .to_vec();
+        assert_eq!(matrices[2].code_range().end as u64, file_bytes);
+        let mut cpu = Engine::new(Kernel::fastest(), 2).unwrap();
+        let mut small = MetalEngine::with_limits(Some(limit as usize), None)
+            .unwrap()
+            .unwrap();
+        let k = 512;
+        let activation: Vec<i8> = (0..3 * k).map(|_| random(&mut seed) as i8).collect();
+        let scale: Vec<i32> = (0..3).map(|_| random(&mut seed) as i32).collect();
+        for (round, order) in [[0, 1, 2], [2, 1, 0]].into_iter().enumerate() {
+            for index in order {
+                let matrix = &matrices[index];
+                let expected = cpu.weighted_sums(matrix, &activation, &scale).unwrap();
+                let sums = small.weighted_sums(matrix, &activation, &scale).unwrap();
+                assert_sums(&sums, &expected, &format!("stream {index}"));
+                if round == 0 {
+                    assert_eq!(small.code_buffers(), index + 1, "stream {index}");
+                }
+            }
+        }
+        assert_eq!(small.code_buffers(), 3);
+    }
+
+    /// A device limit below the default threadgroup (32 x 4 threads) gets fewer
+    /// SIMD groups per tile, with the same sums; below one SIMD group is an error.
+    #[test]
+    fn threadgroup_limit_below_the_default_chooses_fewer_simd_groups() {
+        if engine().is_none() {
+            return;
+        }
+        let bytes = synthetic(6, "warp", 65, 96, 5120, false);
+        let file = TempFile::new(&bytes);
+        // SAFETY: the private file is never modified and outlives all mapping owners.
+        let model = unsafe { MappedModel::open(&file.0) }.unwrap();
+        let matrix = model.matrix("linear").unwrap();
+        let mut seed = 0x2210_00aa_0000_0005;
+        let activation: Vec<i8> = (0..17 * 5120).map(|_| random(&mut seed) as i8).collect();
+        let scales: Vec<i32> = (0..17 * 10).map(|_| random(&mut seed) as i32).collect();
+        let expected = Engine::new(Kernel::fastest(), 2)
+            .unwrap()
+            .weighted_sums(&matrix, &activation, &scales)
+            .unwrap();
+        for limit in [127, 96, 64, 32] {
+            let mut engine = MetalEngine::with_limits(None, Some(limit))
+                .unwrap()
+                .unwrap();
+            assert_eq!(engine.threads_per_threadgroup(), 128);
+
+            let sums = engine.weighted_sums(&matrix, &activation, &scales).unwrap();
+            assert_sums(&sums, &expected, &format!("limit {limit}"));
+        }
+        let mut engine = MetalEngine::with_limits(None, Some(31)).unwrap().unwrap();
+        let error = engine
+            .weighted_sums(&matrix, &activation, &scales)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("threads per threadgroup"), "{error}");
+    }
+
+    #[test]
+    fn unaligned_streams_match_scalar_reference() {
+        let Some(mut engine) = engine() else { return };
+        for bits in 4..=8 {
+            for layout in ["row", "warp"] {
+                for shift in [1, 4, 8] {
+                    let mut bytes = synthetic(bits, layout, 13, 64, 5120, false);
+                    bytes.splice(DATA_OFFSET..DATA_OFFSET, vec![0; shift]);
+                    let file_bytes = bytes.len() as u64;
+                    bytes[16..24].copy_from_slice(&((DATA_OFFSET + shift) as u64).to_le_bytes());
+                    bytes[24..32].copy_from_slice(&file_bytes.to_le_bytes());
+                    let bytes = change_header(&bytes, |header| {
+                        for field in ["stream_off", "lut_off", "scale_off"] {
+                            let offset = header["tensors"][0][field].as_u64().unwrap();
+                            header["tensors"][0][field] = json!(offset + shift as u64);
+                        }
+                    });
+                    let file = TempFile::new(&bytes);
+                    // SAFETY: as above, the private file outlives every mapping owner.
+                    let model = unsafe { MappedModel::open(&file.0) }.unwrap();
+                    let matrix = model.matrix("linear").unwrap();
+                    assert_eq!(matrix.descriptor().stream_offset % 16, shift as u64 % 16);
+                    let mut reader = Container::from_bytes(bytes).unwrap();
+                    let reference =
+                        CompressedLinear::new(reader.load_tensor("linear").unwrap(), false)
+                            .unwrap();
+                    let mut seed = 0x77ed_31a0_9bc1_521d;
+                    let activation: Vec<_> =
+                        (0..5 * 5120).map(|_| random(&mut seed) as i8).collect();
+                    let scales: Vec<_> = (0..50).map(|_| random(&mut seed) as i32).collect();
+                    let expected = reference_sums(&reference, &activation, &scales, 64);
+                    let result = engine.weighted_sums(&matrix, &activation, &scales).unwrap();
+                    assert_sums(
+                        &result,
+                        &expected,
+                        &format!("{layout} bits={bits} shift={shift}"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tensors_sharing_codes_keep_their_own_tables() {
+        let Some(mut engine) = engine() else { return };
+        // Tensor "linear" (A) keeps the fixture's codes; B points at the same codes
+        // but has its own lookup table appended at the end of the file.
+        let mut bytes = synthetic(4, "row", 32, 32, 512, false);
+        let header_length = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let header: serde_json::Value =
+            serde_json::from_slice(&bytes[32..32 + header_length]).unwrap();
+        let table_a = header["tensors"][0]["lut_off"].as_u64().unwrap() as usize;
+        let table_b = bytes.len();
+        let one = mackani_format::f32_to_f16(1.0).to_le_bytes();
+        let minus_one = mackani_format::f32_to_f16(-1.0).to_le_bytes();
+        for pair in bytes[table_a..table_a + 16_384].as_chunks_mut::<2>().0 {
+            *pair = one;
+        }
+        for _ in 0..8192 {
+            bytes.extend_from_slice(&minus_one);
+        }
+        let file_bytes = bytes.len() as u64;
+        bytes[24..32].copy_from_slice(&file_bytes.to_le_bytes());
+        let bytes = change_header(&bytes, |header| {
+            let mut b = header["tensors"][0].clone();
+            b["name"] = json!("b");
+            b["lut_off"] = json!(table_b);
+            header["tensors"].as_array_mut().unwrap().push(b);
+        });
+        let file = TempFile::new(&bytes);
+        // SAFETY: the private file is never modified and outlives all mapping owners.
+        let model = unsafe { MappedModel::open(&file.0) }.unwrap();
+        let a = model.matrix("linear").unwrap();
+        let b = model.matrix("b").unwrap();
+        assert_eq!(a.code_range(), b.code_range());
+        // Every weight quantizes to ±127, so each row is ±512 * 127 whatever the codes.
+        let a_sums = engine.weighted_sums(&a, &[1; 512], &[1]).unwrap();
+        let b_sums = engine.weighted_sums(&b, &[1; 512], &[1]).unwrap();
+        assert_eq!(a_sums, vec![65_024; 32]);
+        assert_eq!(b_sums, vec![-65_024; 32]);
+    }
+
+    #[test]
+    fn invalid_shapes_are_rejected_before_dispatch() {
+        let Some(mut engine) = engine() else { return };
+        let bytes = synthetic(6, "warp", 65, 96, 1024, false);
+        let file = TempFile::new(&bytes);
+        // SAFETY: the private file is never modified and outlives all mapping owners.
+        let model = unsafe { MappedModel::open(&file.0) }.unwrap();
+        let matrix = model.matrix("linear").unwrap();
+        for activation in [vec![], vec![1; 1023], vec![1; 1025]] {
+            assert!(engine.weighted_sums(&matrix, &activation, &[1, 1]).is_err());
+        }
+        for scales in [vec![], vec![1], vec![1; 3]] {
+            assert!(engine.weighted_sums(&matrix, &[1; 1024], &scales).is_err());
+        }
+        for n in [0, 97, usize::MAX] {
+            assert!(
+                engine
+                    .weighted_sums_prefix(&matrix, &[1; 1024], &[1, 1], n)
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            engine.weighted_sums(&matrix, &[0; 1024], &[1, -1]).unwrap(),
+            vec![0; 96]
+        );
+        assert!(engine.round_trip().unwrap() > std::time::Duration::ZERO);
+    }
+}

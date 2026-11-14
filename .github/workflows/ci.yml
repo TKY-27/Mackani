@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, staging]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Pushes to main get a group of their own so no run on main is ever cancelled
+  # or left waiting behind another one; only superseded pull-request runs are.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Apple Silicon / stable
+    # The binary refuses macOS older than 26 at start, and its tests run that check.
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      # Assertions, overflow checks and opt-level 2 stay enabled. Full DWARF
+      # is unnecessary for the CI proof and expensive across integration crates.
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Verify Apple Silicon host
+        run: test "$(uname -m)" = arm64
+      - name: Install Rust stable
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      # The dev profile is optimized (opt-level 2) and keeps debug assertions and
+      # overflow checks, so it is the stricter of the two profiles.
+      - name: Tests
+        run: cargo test --workspace
+      - name: App build and tests
+        working-directory: app
+        run: swift build && swift test

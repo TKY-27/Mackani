@@ -1,0 +1,16 @@
+[package]
+name = "mackani-ref"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Scalar reference for the YASAKANI main model"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+mackani-format.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
