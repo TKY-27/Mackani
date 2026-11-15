@@ -4,6 +4,8 @@
 
 [English](README.md)
 
+[macOS 版をダウンロード](https://github.com/TKY-27/Mackani/releases/latest)
+
 YASAKANI は Windows と NVIDIA RTX 5090 1枚を対象とする、Apache-2.0 のローカルLLMエンジンです。圧縮された `.yskn` ファイルから Qwen3.8-27B を動かします。Mackani は同じ公開モデルフォルダーを Mac で読み込みます。圧縮された射影の計算には Metal、それ以外の処理には NEON とスレッドプールを使います。Rust のエンジンは上流のコードをコピーせず、コミット `758ef28` の動作をまとめた [仕様書](docs/spec/) に基づいて実装しました。
 
 モデルファイルと `.yskn` 形式は YASAKANI 作者の成果です。モデルとエンジンを公開してくださった YASAKANI 作者に感謝します。Mackani は YASAKANI 作者、Qwen チーム、その他の組織とは関係がなく、承認や推奨も受けていません。
@@ -13,9 +15,9 @@ YASAKANI は Windows と NVIDIA RTX 5090 1枚を対象とする、Apache-2.0 の
 ## 必要なもの
 
 - Apple Silicon 搭載の Mac と macOS 26 以降。
-- [rust-toolchain.toml](rust-toolchain.toml) が指定する Rust stable、rustfmt、Clippy。
-- Metal シェーダーとアプリのビルドに使う Xcode コマンドラインツール。アプリには Swift 6.2 が必要です。
 - 別途ダウンロードする公開モデルフォルダー。
+
+ソースからビルドする場合の Rust と Xcode の要件は [BUILDING.md](BUILDING.md) を参照してください。
 
 既定ではコンテキスト長を32,768トークンに設定し、下書きモデルを有効にします。この構成の推定必要メモリは19.03 GiBです。物理メモリに収まらない構成では起動を拒否し、収まる設定を表示します。`info` で、モデルをロードせずに見積もりを確認できます。
 
@@ -75,14 +77,9 @@ OpenAI互換APIはストリーミング、使用トークン数、ツール呼�
 
 ## macOSアプリ
 
-SwiftUI のネイティブアプリです。同梱サーバーの起動と停止をアプリ自身が管理します。バイナリーをビルドした後、ローカルでアプリを作成します。
+[GitHub Releases](https://github.com/TKY-27/Mackani/releases/latest) からアプリの ZIP をダウンロードして展開し、`Mackani.app` を「アプリケーション」フォルダーに移します。SwiftUI アプリが同梱サーバーの起動と停止を管理します。初回起動時は **Choose Model Folder** を押し、ダウンロードしたモデルフォルダーを選びます。あとから設定画面で変更できます。
 
-```sh
-./app/build-app.sh
-open app/build/Mackani.app
-```
-
-初回起動時のウィンドウに「Choose Model Folder」ボタンが出るので、ダウンロードしたフォルダーを選びます。あとから設定画面で変更できます。署名はアドホック署名で、公証は受けていません。ビルド済みアプリの配布もありません。[app/README.md](app/README.md) に詳細があります。
+配布アプリはアドホック署名済みで未公証です。初回起動がブロックされた場合は [Apple の案内](https://support.apple.com/ja-jp/102445) を参照してください。ソースからビルドする場合は [BUILDING.md](BUILDING.md#native-app) を参照してください。
 
 ![Mackani のライト表示](app/docs/screenshot-light.png)
 
@@ -123,7 +120,6 @@ open app/build/Mackani.app
 - テキスト専用です。画像には対応しません。
 - `tool_choice` の強制指定、`logprobs`、`n > 1` は拒否します。
 - 長いコンテキストのプリフィルには時間がかかります。
-- アプリはローカルでビルドする必要があります。アドホック署名で、公証は受けていません。ビルド済みバイナリーの配布はありません。
 
 ## 関連文書
 
