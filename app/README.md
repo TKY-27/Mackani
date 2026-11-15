@@ -5,6 +5,15 @@ Apple Silicon.
 
 ![Mackani in the light appearance](docs/screenshot-light.png)
 
+## Install
+
+Download the app ZIP from [GitHub Releases](https://github.com/TKY-27/Mackani/releases/latest),
+unzip it and move `Mackani.app` to Applications. On first launch, use **Choose Model Folder**
+to select the [downloaded model folder](../README.md#get-the-model).
+
+The app is ad-hoc signed and unnotarized. If macOS blocks the first launch, see [Apple’s guide
+to opening an unnotarized app](https://support.apple.com/en-us/102445).
+
 ## Build
 
 ```sh

@@ -4,7 +4,7 @@
 
 Use an Apple Silicon Mac with macOS 26 or later. Install Rust through rustup and the Xcode command line tools. [rust-toolchain.toml](rust-toolchain.toml) selects stable Rust with rustfmt and Clippy. The native app requires Swift 6.2. Metal shader compilation also needs the Apple developer tools.
 
-Only a base M5 MacBook with 24 GB memory and macOS 27 has been tested. See [README.md](README.md) for the model download, memory estimate and untested configurations. There are no prebuilt binaries.
+Only a base M5 MacBook with 24 GB memory and macOS 27 has been tested. See [README.md](README.md) for the model download, memory estimate and untested configurations. Prebuilt downloads are available on [GitHub Releases](https://github.com/TKY-27/Mackani/releases/latest).
 
 ## Command-line binary
 

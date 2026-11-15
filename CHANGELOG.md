@@ -10,4 +10,4 @@ First release of Mackani, an unofficial Apple Silicon port of YASAKANI.
 - A native SwiftUI chat app that manages its bundled server.
 - Build instructions, behaviour specifications and third-party notices.
 
-Tested only with the speed model on a base Apple M5 MacBook with 24 GB memory and macOS 27. No prebuilt binaries.
+Tested only with the speed model on a base Apple M5 MacBook with 24 GB memory and macOS 27. The macOS app and command-line binary are available in [v0.1.0](https://github.com/TKY-27/Mackani/releases/tag/v0.1.0).

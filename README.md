@@ -4,6 +4,8 @@ An unofficial Apple Silicon port of [YASAKANI](https://github.com/yasakani-dev/y
 
 [日本語](README.ja.md)
 
+[Download Mackani for macOS](https://github.com/TKY-27/Mackani/releases/latest)
+
 YASAKANI is an Apache-2.0 local LLM engine for Windows and one NVIDIA RTX 5090. It runs Qwen3.8-27B from compressed `.yskn` files. Mackani reads the same published model folder on a Mac. It uses Metal for compressed projections, and NEON and a thread pool for the remaining work. Its Rust engine was written against the behaviour specification in [docs/spec/](docs/spec/), derived from upstream commit `758ef28`, without copying upstream engine code.
 
 The model files and the `.yskn` format are the YASAKANI authors' work. Thank you to the YASAKANI authors for publishing them and their engine. Mackani is not affiliated with or endorsed by the YASAKANI authors, the Qwen team or any other organisation.
@@ -13,9 +15,9 @@ The model files and the `.yskn` format are the YASAKANI authors' work. Thank you
 ## Requirements
 
 - A Mac with Apple Silicon and macOS 26 or later.
-- Rust stable, as selected by [rust-toolchain.toml](rust-toolchain.toml), with rustfmt and Clippy.
-- Xcode command line tools for the Metal shader and the app; the app uses Swift 6.2.
 - The published model folder, downloaded separately.
+
+For a source build, see the Rust and Xcode requirements in [BUILDING.md](BUILDING.md).
 
 The default configuration reserves a 32,768-token context and enables the draft model. Its estimated memory need is 19.03 GiB. Startup refuses a configuration that does not fit physical memory and lists alternatives that would fit. `info` prints the estimate without loading the model.
 
@@ -75,14 +77,9 @@ The OpenAI-compatible API supports streaming, usage counts and tool calls. Think
 
 ## macOS app
 
-The native SwiftUI app starts and stops its bundled server itself. Build it locally after building the binary:
+Download the app ZIP from [GitHub Releases](https://github.com/TKY-27/Mackani/releases/latest), unzip it and move `Mackani.app` to Applications. The native SwiftUI app starts and stops its bundled server. On first launch, click **Choose Model Folder** and select the downloaded folder. You can change it later in Settings.
 
-```sh
-./app/build-app.sh
-open app/build/Mackani.app
-```
-
-On first launch the window offers a Choose Model Folder button; pick the downloaded folder. It can be changed later in Settings. The app has an ad-hoc signature, is not notarized and has no prebuilt download. See [app/README.md](app/README.md).
+The app is ad-hoc signed and unnotarized. See the [installation instructions](app/README.md#install) if macOS blocks the first launch. To build the app from source, see [BUILDING.md](BUILDING.md#native-app).
 
 ![Mackani in the light appearance](app/docs/screenshot-light.png)
 
@@ -123,7 +120,6 @@ The test machine is the base M5 MacBook described above, with nothing else runni
 - Text only; images are not supported.
 - Forced `tool_choice`, `logprobs` and `n > 1` are rejected.
 - Long contexts are slow to prefill.
-- The app must be built locally. Its signature is ad hoc and it is not notarized. There are no prebuilt binaries.
 
 ## Read more
 
