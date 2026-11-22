@@ -153,6 +153,12 @@ mod macos {
                 .fused_mlp([&down, &up, &gate], &[0; 512], &[0], &[0.0], &[1.0])
                 .is_err()
         );
+        assert!(
+            engine
+                .fused_mlp([&gate, &down, &down], &[0; 512], &[0], &[0.0], &[1.0])
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

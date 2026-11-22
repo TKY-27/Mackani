@@ -193,11 +193,12 @@ impl MetalEngine {
     /// quantization and the down projection. `matrices` is [gate, up, down];
     /// gate and up must carry output rotations.
     ///
-    /// The result equals the reference's: `Ok(None)` when the device cannot run
-    /// the span, or when a value met on the GPU could round differently there (a
-    /// subnormal, which the GPU flushes to zero) or makes the reference fail (a
-    /// non-finite value). The caller then runs the stages unfused, which give
-    /// the reference's result or error. Every row runs on the GPU.
+    /// The result equals the reference's: `Ok(None)` when the device or the
+    /// tensors' layout cannot run the span, or when a value met on the GPU could
+    /// round differently there (a subnormal, which the GPU flushes to zero) or
+    /// makes the reference fail (a non-finite value). The caller then runs the
+    /// stages unfused, which give the reference's result or error. Every row
+    /// runs on the GPU.
     pub fn fused_mlp(
         &mut self,
         matrices: [&Matrix; 3],
@@ -212,17 +213,17 @@ impl MetalEngine {
         let complete_rotation = |matrix: &Matrix| {
             matrix.output_signs().map(<[i8]>::len) == Some(matrix.descriptor().physical_rows)
         };
-        if m == 0
-            || inverse_rms.len() != m
-            || activation.len() != m * g.cols
-            || (g.rows, g.physical_rows, g.cols) != (u.rows, u.physical_rows, u.cols)
+        if m == 0 || inverse_rms.len() != m || activation.len() != m * g.cols {
+            return Err(invalid("invalid fused MLP input"));
+        }
+        if (g.rows, g.physical_rows, g.cols) != (u.rows, u.physical_rows, u.cols)
             || !g.physical_rows.is_multiple_of(512)
             || !complete_rotation(gate)
             || !complete_rotation(up)
             || d.cols != g.rows
             || down.input_signs().len() != d.cols
         {
-            return Err(invalid("invalid fused MLP shapes"));
+            return Ok(None);
         }
         let Some(stages) = self.mlp.clone() else {
             return Ok(None);
