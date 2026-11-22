@@ -199,7 +199,7 @@ impl Compute {
     }
     /// Each matrix's M×N sums for one shared input: one Metal command buffer
     /// (with the CPU kernel computing its calibrated share of the rows meanwhile,
-    ///), or one CPU kernel call per matrix.
+    ///), or one CPU pool dispatch for the whole group.
     pub(crate) fn weighted_sums(
         &mut self,
         matrices: &[&Matrix],
@@ -210,9 +210,184 @@ impl Compute {
         if let Some(metal) = &mut self.metal {
             return metal.weighted_sums_split(&mut self.engine, matrices, activation, scales);
         }
-        matrices
+        let parts: Vec<_> = matrices
             .iter()
-            .map(|matrix| self.engine.weighted_sums(matrix, activation, scales))
-            .collect()
+            .map(|matrix| (*matrix, 0..matrix.descriptor().physical_rows))
+            .collect();
+        self.engine.weighted_sums_rows(&parts, activation, scales)
+    }
+}
+
+#[cfg(test)]
+#[path = "../../tests/fixture/mod.rs"]
+#[allow(
+    clippy::duplicate_mod,
+    reason = "Metal tests independently load this private fixture module on macOS."
+)]
+mod fixture;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_projection_groups_match_independent_scalar_rows() {
+        use mackani_ref::compressed_linear::CompressedLinear;
+        let bytes: Vec<_> = [(6, "warp", 320), (5, "row", 75), (8, "warp", 32)]
+            .into_iter()
+            .map(|(bits, layout, n)| fixture::synthetic(bits, layout, n, n, 1024, false))
+            .collect();
+        let files: Vec<_> = bytes.iter().map(|b| fixture::TempFile::new(b)).collect();
+        let models: Vec<_> = files
+            .iter()
+            .map(|file| {
+                // SAFETY: private immutable fixtures outlive every mapping and worker.
+                unsafe { MappedModel::open(&file.0) }.unwrap()
+            })
+            .collect();
+        let matrices: Vec<_> = models
+            .iter()
+            .map(|model| model.matrix("linear").unwrap())
+            .collect();
+        let refs: Vec<_> = matrices.iter().collect();
+        let references: Vec<_> = bytes
+            .into_iter()
+            .map(|bytes| {
+                let mut reader = mackani_format::Container::from_bytes(bytes).unwrap();
+                CompressedLinear::new(reader.load_tensor("linear").unwrap(), false).unwrap()
+            })
+            .collect();
+        let mut seed = 718;
+        for kernel in crate::Kernel::available_variants() {
+            for threads in [1, 4] {
+                let mut compute =
+                    Compute::new(Engine::new(kernel, threads).unwrap(), Backend::Cpu).unwrap();
+                assert!(compute.weighted_sums(&[], &[], &[]).unwrap().is_empty());
+                for m in [1, 4, 16] {
+                    let activation: Vec<i8> = (0..m * 1024)
+                        .map(|_| fixture::random(&mut seed) as i8)
+                        .collect();
+                    let scales: Vec<i32> = (0..m * 2)
+                        .map(|_| fixture::random(&mut seed) as i32)
+                        .collect();
+                    let grouped = compute.weighted_sums(&refs, &activation, &scales).unwrap();
+                    for (index, matrix) in matrices.iter().enumerate() {
+                        let individual = compute
+                            .engine
+                            .weighted_sums(matrix, &activation, &scales)
+                            .unwrap();
+                        assert_eq!(grouped[index], individual);
+                        let scalar: Vec<_> = (0..m)
+                            .flat_map(|row| {
+                                references[index]
+                                    .weighted_sums(
+                                        &activation[row * 1024..(row + 1) * 1024],
+                                        &scales[row * 2..(row + 1) * 2],
+                                        matrix.descriptor().physical_rows,
+                                    )
+                                    .unwrap()
+                            })
+                            .collect();
+                        assert_eq!(grouped[index], scalar);
+                    }
+                    assert!(
+                        compute
+                            .weighted_sums(&refs, &activation[..activation.len() - 1], &scales)
+                            .is_err()
+                    );
+                    assert!(
+                        compute
+                            .weighted_sums(&refs, &activation, &scales[..scales.len() - 1])
+                            .is_err()
+                    );
+                    assert!(compute.weighted_sums(&refs, &[], &[]).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "synthetic projection timing; run in release mode"]
+    fn bench_cpu_projection_group() {
+        use std::{hint::black_box, time::Instant};
+        let files: Vec<_> = [2048, 256, 256]
+            .into_iter()
+            .map(|n| fixture::TempFile::new(&fixture::synthetic(6, "warp", n, n, 2048, false)))
+            .collect();
+        let models: Vec<_> = files
+            .iter()
+            .map(|file| {
+                // SAFETY: private immutable fixtures outlive every mapping and worker.
+                unsafe { MappedModel::open(&file.0) }.unwrap()
+            })
+            .collect();
+        let matrices: Vec<_> = models
+            .iter()
+            .map(|model| model.matrix("linear").unwrap())
+            .collect();
+        let refs: Vec<_> = matrices.iter().collect();
+        let mut compute = Compute::new(
+            Engine::new(crate::Kernel::fastest(), 4).unwrap(),
+            Backend::Cpu,
+        )
+        .unwrap();
+        let mut seed = 42;
+        for m in [1, 4, 16] {
+            let activation: Vec<i8> = (0..m * 2048)
+                .map(|_| fixture::random(&mut seed) as i8)
+                .collect();
+            let scales: Vec<i32> = (0..m * 4)
+                .map(|_| fixture::random(&mut seed) as i32)
+                .collect();
+            for _ in 0..10 {
+                black_box(compute.weighted_sums(&refs, &activation, &scales).unwrap());
+            }
+            let mut times = Vec::new();
+            for _ in 0..101 {
+                let start = Instant::now();
+                black_box(compute.weighted_sums(&refs, &activation, &scales).unwrap());
+                times.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            times.sort_by(f64::total_cmp);
+            println!(
+                "M={m} threads=4 K=2048 N=2048,256,256 median_ms={:.6} p25={:.6} p75={:.6}",
+                times[50], times[25], times[75]
+            );
+            if std::env::var_os("PROJECTION_COMPARE").is_some() {
+                let mut paired = [Vec::new(), Vec::new()];
+                let mut ratios = Vec::new();
+                for iteration in 0..301 {
+                    let mut elapsed = [0.0; 2];
+                    for index in [iteration % 2, 1 - iteration % 2] {
+                        let start = Instant::now();
+                        let output = if index == 0 {
+                            refs.iter()
+                                .map(|matrix| {
+                                    compute
+                                        .engine
+                                        .weighted_sums(matrix, &activation, &scales)
+                                        .unwrap()
+                                })
+                                .collect::<Vec<_>>()
+                        } else {
+                            compute.weighted_sums(&refs, &activation, &scales).unwrap()
+                        };
+                        black_box(output);
+                        elapsed[index] = start.elapsed().as_secs_f64() * 1000.0;
+                        paired[index].push(elapsed[index]);
+                    }
+                    ratios.push(elapsed[0] / elapsed[1]);
+                }
+                let wins = ratios.iter().filter(|&&ratio| ratio > 1.0).count();
+                for times in &mut paired {
+                    times.sort_by(f64::total_cmp);
+                }
+                ratios.sort_by(f64::total_cmp);
+                println!(
+                    "paired M={m} old_ms={:.6} new_ms={:.6} median_speedup={:.4} wins={wins}/301 ratio_p25={:.4} ratio_p75={:.4}",
+                    paired[0][150], paired[1][150], ratios[150], ratios[75], ratios[225]
+                );
+            }
+        }
     }
 }
