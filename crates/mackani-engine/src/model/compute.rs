@@ -220,6 +220,10 @@ impl Compute {
 
 #[cfg(test)]
 #[path = "../../tests/fixture/mod.rs"]
+#[allow(
+    clippy::duplicate_mod,
+    reason = "Metal tests independently load this private fixture module on macOS."
+)]
 mod fixture;
 
 #[cfg(test)]
