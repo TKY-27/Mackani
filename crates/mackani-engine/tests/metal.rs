@@ -52,6 +52,115 @@ mod macos {
             .collect()
     }
 
+    /// The fused MLP span equals the reference's gate+up restore, gated product,
+    /// quantization and down sums, and declines inputs it cannot match.
+    #[test]
+    fn fused_mlp_matches_scalar_reference_or_declines() {
+        use mackani_ref::compressed_linear::{quantize_activation, restore_projection};
+        use mackani_ref::residual_norm_mlp::gated_product;
+        let Some(mut engine) = engine() else { return };
+        let file = TempFile::new(&support::synthetic_model_with_dimensions(
+            23,
+            &["linear_attention"],
+            512,
+            1024,
+            65,
+        ));
+        // SAFETY: the private file is never changed while this model, its
+        // matrices, or the engine's no-copy buffers exist.
+        let model = unsafe { MappedModel::open(&file.0) }.unwrap();
+        let [gate, up, down] = ["gate", "up", "down"]
+            .map(|name| model.matrix(&format!("layers.0.mlp.{name}_proj")).unwrap());
+        let mut cpu = Engine::new(Kernel::Portable, 1).unwrap();
+        let mut seed = 0x6d1f_2a37_0c44_b981;
+        for m in [1, 3, 16, 17] {
+            let prepared: Vec<_> = (0..m)
+                .map(|_| {
+                    let hidden: Vec<f32> = (0..512)
+                        .map(|_| random(&mut seed) as i32 as f32 / 536_870_912.0)
+                        .collect();
+                    quantize_activation(&hidden, gate.input_signs()).unwrap()
+                })
+                .collect();
+            let activation: Vec<i8> = prepared
+                .iter()
+                .flat_map(|p| p.activation8().iter().copied())
+                .collect();
+            let scales: Vec<i32> = prepared
+                .iter()
+                .flat_map(|p| p.integer_scale().iter().copied())
+                .collect();
+            let row_quantum: Vec<f32> = prepared.iter().map(|p| p.row_quantum()).collect();
+            let inverse_rms: Vec<f32> = (0..m).map(|i| 0.75 + i as f32 / 64.0).collect();
+            let sums = [&gate, &up].map(|matrix| {
+                (
+                    matrix,
+                    cpu.weighted_sums(matrix, &activation, &scales).unwrap(),
+                )
+            });
+            let (mut expected, mut expected_quantum) = (Vec::new(), Vec::new());
+            for i in 0..m {
+                let [g, u] = sums.each_ref().map(|(matrix, sums)| {
+                    let n = matrix.descriptor().physical_rows;
+                    restore_projection(
+                        &sums[i * n..(i + 1) * n],
+                        &prepared[i],
+                        Some(inverse_rms[i]),
+                        matrix.effective_row_scale(),
+                        matrix.output_signs(),
+                        matrix.descriptor().rows,
+                    )
+                    .unwrap()
+                });
+                let product =
+                    quantize_activation(&gated_product(&g, &u).unwrap(), down.input_signs())
+                        .unwrap();
+                expected.extend(
+                    cpu.weighted_sums(&down, product.activation8(), product.integer_scale())
+                        .unwrap(),
+                );
+                expected_quantum.push(product.row_quantum().to_bits());
+            }
+            let fused = engine
+                .fused_mlp(
+                    [&gate, &up, &down],
+                    &activation,
+                    &scales,
+                    &row_quantum,
+                    &inverse_rms,
+                )
+                .unwrap()
+                .expect("normal values run fused");
+            assert_sums(&fused.down, &expected, &format!("fused MLP M={m}"));
+            let quantum: Vec<_> = fused.row_quantum.iter().map(|q| q.to_bits()).collect();
+            assert_eq!(quantum, expected_quantum, "fused MLP M={m}");
+            // A subnormal (which the GPU may flush) or non-finite input declines.
+            for value in [f32::from_bits(1), f32::INFINITY, f32::NAN] {
+                let mut inverse_rms = inverse_rms.clone();
+                inverse_rms[m - 1] = value;
+                let fused = engine.fused_mlp(
+                    [&gate, &up, &down],
+                    &activation,
+                    &scales,
+                    &row_quantum,
+                    &inverse_rms,
+                );
+                assert!(fused.unwrap().is_none(), "M={m} inverse RMS {value:e}");
+            }
+        }
+        assert!(
+            engine
+                .fused_mlp([&down, &up, &gate], &[0; 512], &[0], &[0.0], &[1.0])
+                .is_err()
+        );
+        assert!(
+            engine
+                .fused_mlp([&gate, &down, &down], &[0; 512], &[0], &[0.0], &[1.0])
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn metal_matches_scalar_reference_for_layouts_bits_shapes_and_batches() {
         let Some(mut engine) = engine() else { return };

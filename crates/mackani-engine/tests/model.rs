@@ -444,6 +444,33 @@ fn default_and_explicit_constructors_keep_int8() {
     assert_eq!(backend.kv_mode(), KvMode::Int8);
 }
 
+/// With vectorized CPU stages a Metal pass fuses each layer's gate+up and down
+/// into one command buffer; the reference stages keep them apart. Logits match.
+#[test]
+fn metal_mlp_fusion_saves_one_command_buffer_per_layer() {
+    if !metal_device() {
+        return;
+    }
+    let fixture = Fixture::new(&support::synthetic_model(
+        107,
+        &["linear_attention", "full_attention"],
+    ));
+    let tokens = [3, 17, 42, 5, 99];
+    let pass = |stages| {
+        let mut model = fixture.backend_model(Backend::Metal, 2, tokens.len());
+        model.set_cpu_stages(stages).unwrap();
+        let before = model.metal_command_buffers().unwrap();
+        model.prefill(&tokens).unwrap();
+        let committed = model.metal_command_buffers().unwrap() - before;
+        (committed, model.row_logits().to_vec())
+    };
+    let (unfused, expected) = pass(mackani_engine::CpuStages::Reference);
+    let (fused, logits) = pass(mackani_engine::CpuStages::Auto);
+    println!("command buffers per pass: unfused {unfused}, fused {fused}");
+    assert_eq!(unfused - fused, 2);
+    same(&logits, &expected, "fused MLP");
+}
+
 #[test]
 fn explicit_metal_share_preserves_logits() {
     if !metal_device() {

@@ -169,6 +169,13 @@ impl Compute {
         }
         None
     }
+    pub(crate) fn metal_command_buffers(&self) -> Option<u64> {
+        #[cfg(target_os = "macos")]
+        if let Some(metal) = &self.metal {
+            return Some(metal.command_buffers());
+        }
+        None
+    }
     pub(crate) fn threads(&self) -> usize {
         self.engine.threads()
     }
@@ -214,5 +221,26 @@ impl Compute {
             .iter()
             .map(|matrix| self.engine.weighted_sums(matrix, activation, scales))
             .collect()
+    }
+    /// The down projection's M×N sums and row quanta of the MLP span for one
+    /// normalized input ([`MetalEngine::fused_mlp`]): Metal with vectorized CPU
+    /// stages only. `None` everywhere else and when the span must instead run
+    /// unfused, which then gives the reference's result or error.
+    pub(crate) fn fused_mlp(
+        &mut self,
+        matrices: [&Matrix; 3],
+        activation: &[i8],
+        scales: &[i32],
+        row_quantum: &[f32],
+        inverse_rms: &[f32],
+    ) -> Result<Option<(Vec<i64>, Vec<f32>)>> {
+        #[cfg(target_os = "macos")]
+        if let Some(metal) = self.metal.as_mut().filter(|_| self.cpu_stages) {
+            let fused = metal.fused_mlp(matrices, activation, scales, row_quantum, inverse_rms)?;
+            return Ok(fused.map(|f| (f.down, f.row_quantum)));
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (matrices, activation, scales, row_quantum, inverse_rms);
+        Ok(None)
     }
 }

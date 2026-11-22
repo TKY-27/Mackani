@@ -306,7 +306,7 @@ pub fn restore_projection(
 ) -> Result<Vec<f32>> {
     restore_projection_with_transform(
         weighted_sums,
-        prepared,
+        prepared.row_quantum(),
         inverse_rms,
         effective_row_scale,
         output_signs,
@@ -318,7 +318,7 @@ pub fn restore_projection(
 /// Engine inverse-transform hook with the reference scale and conversion order.
 pub fn restore_projection_with_transform(
     weighted_sums: &[i64],
-    prepared: &PreparedActivation,
+    row_quantum: f32,
     inverse_rms: Option<f32>,
     effective_row_scale: &[f32],
     output_signs: Option<&[i8]>,
@@ -344,7 +344,7 @@ pub fn restore_projection_with_transform(
     for (row, linear) in output.iter_mut().enumerate() {
         // There is exactly one i64->f32 conversion. Restore scales in the
         // specified order; neither reassociation nor an FMA is equivalent.
-        *linear = weighted_sums[row] as f32 * prepared.row_quantum();
+        *linear = weighted_sums[row] as f32 * row_quantum;
         if let Some(inverse_rms) = inverse_rms {
             *linear *= inverse_rms;
         }

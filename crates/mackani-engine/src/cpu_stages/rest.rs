@@ -23,7 +23,7 @@ pub(crate) fn quantize_activation(input: &[f32], signs: &[i8]) -> Result<Prepare
 }
 pub(crate) fn restore_projection(
     sums: &[i64],
-    prepared: &PreparedActivation,
+    row_quantum: f32,
     inverse_rms: Option<f32>,
     scales: &[f32],
     signs: Option<&[i8]>,
@@ -32,7 +32,7 @@ pub(crate) fn restore_projection(
     if super::neon_available() {
         compressed_linear::restore_projection_with_transform(
             sums,
-            prepared,
+            row_quantum,
             inverse_rms,
             scales,
             signs,
@@ -40,7 +40,15 @@ pub(crate) fn restore_projection(
             hadamard512,
         )
     } else {
-        compressed_linear::restore_projection(sums, prepared, inverse_rms, scales, signs, rows)
+        compressed_linear::restore_projection_with_transform(
+            sums,
+            row_quantum,
+            inverse_rms,
+            scales,
+            signs,
+            rows,
+            compressed_linear::hadamard512,
+        )
     }
 }
 fn hadamard512(values: &mut [f32; 512]) {
@@ -361,7 +369,7 @@ mod tests {
                     same_result(
                         restore_projection(
                             &sums,
-                            &a.prepared,
+                            a.prepared.row_quantum(),
                             inverse,
                             &other,
                             rotation,
@@ -442,7 +450,14 @@ mod tests {
         let prepared = quantize_activation(&input, &vec![1; 512]).unwrap();
         for inverse in [Some(f32::NAN), Some(f32::INFINITY)] {
             same_result(
-                restore_projection(&[1; 512], &prepared, inverse, &input, None, 512),
+                restore_projection(
+                    &[1; 512],
+                    prepared.row_quantum(),
+                    inverse,
+                    &input,
+                    None,
+                    512,
+                ),
                 compressed_linear::restore_projection(
                     &[1; 512], &prepared, inverse, &input, None, 512,
                 ),

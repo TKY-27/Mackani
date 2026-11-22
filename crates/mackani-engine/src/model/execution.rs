@@ -36,47 +36,67 @@ fn project_normalized<const N: usize>(
         .collect();
     project(engine, linears, &input, timing)
 }
+/// Concatenated int8 rows and integer scales of prepared activations.
+fn projection_inputs<'a>(
+    prepared: impl Iterator<Item = &'a PreparedActivation> + Clone,
+) -> (Vec<i8>, Vec<i32>) {
+    (
+        prepared
+            .clone()
+            .flat_map(|p| p.activation8().iter().copied())
+            .collect(),
+        prepared
+            .flat_map(|p| p.integer_scale().iter().copied())
+            .collect(),
+    )
+}
+/// The vectorized restore of one activation row's sums of `linear`.
+fn restore_linear(
+    linear: &Linear,
+    sums: &[i64],
+    row_quantum: f32,
+    inverse_rms: Option<f32>,
+) -> Result<Vec<f32>> {
+    restore_projection(
+        sums,
+        row_quantum,
+        inverse_rms,
+        linear.matrix.effective_row_scale(),
+        linear.output_signs(),
+        linear.matrix.descriptor().rows,
+    )
+}
 fn project<const N: usize>(
     engine: &mut Compute,
     linears: [&Linear; N],
     inputs: &[(&PreparedActivation, Option<f32>)],
     timing: &mut PassTiming,
 ) -> Result<[Vec<Vec<f32>>; N]> {
-    let activation: Vec<_> = inputs
-        .iter()
-        .flat_map(|(p, _)| p.activation8().iter().copied())
-        .collect();
-    let scales: Vec<_> = inputs
-        .iter()
-        .flat_map(|(p, _)| p.integer_scale().iter().copied())
-        .collect();
+    let (activation, scales) = projection_inputs(inputs.iter().map(|(p, _)| *p));
     let matrices = linears.map(|linear| &linear.matrix);
     let start = Instant::now();
     let sums = engine.weighted_sums(&matrices, &activation, &scales)?;
     timing.kernel += start.elapsed();
     let start = timing.detailed_start();
     let m = inputs.len();
-    let restore_projection = if engine.cpu_stages {
-        restore_projection
-    } else {
-        mackani_ref::compressed_linear::restore_projection
-    };
+    let fast = engine.cpu_stages;
     let mut rows = engine
         .map_range(0..N * m, |index| {
             let (linear, sums, i) = (linears[index / m], &sums[index / m], index % m);
             let n = linear.matrix.descriptor().physical_rows;
-            restore_projection(
-                &sums[i * n..(i + 1) * n],
-                inputs[i].0,
-                inputs[i].1,
-                linear.matrix.effective_row_scale(),
-                if linear.output_rotation {
-                    linear.matrix.output_signs()
-                } else {
-                    None
-                },
-                linear.matrix.descriptor().rows,
-            )
+            let (sums, (prepared, inverse_rms)) = (&sums[i * n..(i + 1) * n], inputs[i]);
+            if fast {
+                restore_linear(linear, sums, prepared.row_quantum(), inverse_rms)
+            } else {
+                mackani_ref::compressed_linear::restore_projection(
+                    sums,
+                    prepared,
+                    inverse_rms,
+                    linear.matrix.effective_row_scale(),
+                    linear.output_signs(),
+                    linear.matrix.descriptor().rows,
+                )
+            }
         })?
         .into_iter();
     if let Some(start) = start {
@@ -100,6 +120,43 @@ fn project_rows(
     let inputs: Vec<_> = prepared.iter().map(|p| (p, None)).collect();
     let [projected] = project(engine, [linear], &inputs, timing)?;
     Ok(projected)
+}
+/// The down projection of the MLP's gated product, from one Metal command
+/// buffer covering gate+up, the gated product, its quantization and down;
+/// `None` where [`Compute::fused_mlp`] does not apply.
+fn fused_mlp(
+    engine: &mut Compute,
+    layer: &Layer<Linear>,
+    input: &[NormalizedInput],
+    timing: &mut PassTiming,
+) -> Result<Option<Vec<Vec<f32>>>> {
+    if !(layer.gate.output_rotation && layer.up.output_rotation) {
+        return Ok(None);
+    }
+    let (activation, scales) = projection_inputs(input.iter().map(|x| &x.prepared));
+    let row_quantum: Vec<_> = input.iter().map(|x| x.prepared.row_quantum()).collect();
+    let inverse_rms: Vec<_> = input.iter().map(|x| x.inverse_rms).collect();
+    let start = Instant::now();
+    let fused = engine.fused_mlp(
+        [&layer.gate.matrix, &layer.up.matrix, &layer.down.matrix],
+        &activation,
+        &scales,
+        &row_quantum,
+        &inverse_rms,
+    )?;
+    timing.kernel += start.elapsed();
+    let Some((sums, row_quantum)) = fused else {
+        return Ok(None);
+    };
+    let start = timing.detailed_start();
+    let n = layer.down.matrix.descriptor().physical_rows;
+    let down = engine.map_range(0..input.len(), |i| {
+        restore_linear(&layer.down, &sums[i * n..(i + 1) * n], row_quantum[i], None)
+    })?;
+    if let Some(start) = start {
+        timing.projection_restore += start.elapsed();
+    }
+    Ok(Some(down))
 }
 /// The reference's `GatedDeltaNet::step` stages for a pass of rows: rows are
 /// prepared in parallel (they read only earlier rows' rounded projections), then
@@ -411,13 +468,18 @@ fn forward(
         epsilon,
         timing,
     )?;
-    let [gate, up] = project_normalized(engine, [&layer.gate, &layer.up], &input, timing)?;
-    let start = timing.detailed_start();
-    let product = engine.map_range(0..hidden.len(), |i| gated_product(&gate[i], &up[i]))?;
-    if let Some(start) = start {
-        timing.mlp_gate += start.elapsed();
-    }
-    let down = project_rows(engine, &layer.down, &product, timing)?;
+    let down = match fused_mlp(engine, layer, &input, timing)? {
+        Some(down) => down,
+        None => {
+            let [gate, up] = project_normalized(engine, [&layer.gate, &layer.up], &input, timing)?;
+            let start = timing.detailed_start();
+            let product = engine.map_range(0..hidden.len(), |i| gated_product(&gate[i], &up[i]))?;
+            if let Some(start) = start {
+                timing.mlp_gate += start.elapsed();
+            }
+            project_rows(engine, &layer.down, &product, timing)?
+        }
+    };
     let start = timing.detailed_start();
     let result = engine.map_range(0..hidden.len(), |i| residual_add(&hidden[i], &down[i]))?;
     if let Some(start) = start {

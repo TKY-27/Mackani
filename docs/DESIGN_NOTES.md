@@ -338,10 +338,11 @@ not measured end-to-end speed.
 
 ## Future work
 
-- Reduce GPU command buffers per pass. The current 64-layer logit pass uses
-  257 submissions; loaded-machine measurements on the stated M5 attribute
-  approximately 36 ms of a one-row pass to scheduling/completion round trips.
-  Reducing that count requires crossing a CPU/GPU floating-stage dependency.
+- Reduce GPU command buffers per pass further. Fusing each MLP's gate+up and
+  down brought the 64-layer logit pass from 257 to 193 submissions;
+  loaded-machine measurements on the stated M5 attributed approximately 36 ms
+  of a one-row pass at 257 to scheduling/completion round trips. The
+  remaining groups cross recurrent and attention floating stages.
 - Measure a bounded spin before CPU threads park between short jobs.
 - Merge compatible per-layer pool dispatches without changing scalar order.
 - Schedule useful CPU work during the GPU wait beyond the exact projection share.
