@@ -20,7 +20,7 @@ pub use machine::Machine;
 pub use mackani_ref::{Error, KvMode, Result};
 pub use mapped::{MappedModel, Matrix};
 #[cfg(target_os = "macos")]
-pub use metal::{Job, MetalEngine};
+pub use metal::{FusedMlp, Job, MetalEngine};
 pub use model::{
     Backend, CpuShare, ExecutionOptions, LogitRows, MetalOptions, Model, PassTiming, SessionMemory,
     Snapshot,

@@ -37,6 +37,10 @@ impl Linear {
     fn input_signs(&self) -> &[i8] {
         self.matrix.input_signs()
     }
+    /// The signs of the inverse output rotation, when the consumer applies one.
+    fn output_signs(&self) -> Option<&[i8]> {
+        self.matrix.output_signs().filter(|_| self.output_rotation)
+    }
 }
 
 /// Wall times cover nonoverlapping stages of a complete layer-major pass.
@@ -198,6 +202,10 @@ impl Model {
     /// The device selected for compressed projections.
     pub fn backend(&self) -> Backend {
         self.engine.backend()
+    }
+    /// Metal command buffers committed by this model so far; `None` on the CPU backend.
+    pub fn metal_command_buffers(&self) -> Option<u64> {
+        self.engine.metal_command_buffers()
     }
     /// The projection device: the Metal device name, or the CPU kernel and threads.
     pub fn device(&self) -> String {

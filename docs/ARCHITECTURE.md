@@ -80,18 +80,26 @@ Each layer executes the following sequence in `model/execution.rs`:
    form the SiLU-gated product with its specified rounding.
 7. CPU: quantize the product. Projection backend: compute down.
    CPU: restore it and perform the second BF16 residual addition.
+   On Metal with vectorized CPU stages, steps 6 and 7 share one command
+   buffer: after gate and up, Metal kernels restore them, form the gated
+   product, quantize it and compute down. A span meeting a subnormal or
+   non-finite value, which the GPU could round differently or the reference
+   rejects, is recomputed by the CPU stages instead.
 
 The GPU performs compressed projections only. Each call consumes CPU-prepared
 int8 activations and integer scales; Metal widens activations to exact half
 integers and returns row-major i64 sums in shared buffers.
-Floating restoration and all branch state remain on the CPU.
+Apart from the fused MLP span, floating restoration and all branch state
+remain on the CPU.
 With a CPU share enabled, the CPU kernel computes the last complete output-row
 tiles concurrently with the GPU prefix. Both return the same exact integers.
+The fused MLP span runs every row on the GPU.
 The CPU backend performs every projection on the pool instead.
 
-Every layer has four projection groups. A model with 64 layers plus its final
-vocabulary head uses 257 command buffers for a pass that requests logits and
-fits within Metal's 16-activation-row dispatch width.
+Every layer has four projection groups; on Metal, gate+up and down share one
+command buffer. A model with 64 layers plus its final vocabulary head uses 193
+command buffers (257 with reference CPU stages) for a pass that requests
+logits and fits within Metal's 16-activation-row dispatch width.
 After the final layer, the CPU normalizes selected rows and the projection
 backend computes the vocabulary head. `LogitRows::{All,Last,None}` controls
 which heads are evaluated; it does not change layer arithmetic.

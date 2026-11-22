@@ -25,11 +25,14 @@ unsafe extern "C" {
     fn getpagesize() -> c_int;
 }
 
+mod mlp;
 mod submission;
+pub use mlp::FusedMlp;
 pub use submission::Job;
 use submission::{InFlight, download, reserve, upload};
 
 const SOURCE: &str = include_str!("linear.metal");
+const MLP_SOURCE: &str = include_str!("mlp.metal");
 
 /// Binary16 encodings of every i8 value; all are exactly representable.
 static HALF: std::sync::LazyLock<[u16; 256]> = std::sync::LazyLock::new(|| {
@@ -60,7 +63,7 @@ fn decode_block(bits: usize) -> String {
 }
 
 fn shader_source() -> String {
-    (4..=8).map(decode_block).collect::<String>() + SOURCE
+    (4..=8).map(decode_block).collect::<String>() + SOURCE + MLP_SOURCE
 }
 /// Activation rows per dispatch; the shader's register arrays hold 16.
 const MAX_ROWS_PER_DISPATCH: usize = 16;
@@ -220,6 +223,13 @@ pub struct MetalEngine {
     scratch_activation: Option<Retained<Buffer>>,
     scratch_scales: Option<Retained<Buffer>>,
     scratch_outputs: Vec<Option<Retained<Buffer>>>,
+    /// The fused MLP stages, when the device runs them.
+    mlp: Option<mlp::Pipelines>,
+    /// Per-tensor row scales and signs of fused MLP spans, keyed like `tables`.
+    constants: HashMap<(usize, u64, mlp::Constant), Retained<Buffer>>,
+    silu: Option<Retained<Buffer>>,
+    scratch_mlp: mlp::Scratch,
+    command_buffers: std::cell::Cell<u64>,
 }
 
 impl MetalEngine {
@@ -279,6 +289,7 @@ impl MetalEngine {
             ));
         }
         let device_limit = device.maxBufferLength();
+        let mlp = mlp::Pipelines::new(&device, &library, max_threads_per_threadgroup)?;
         Ok(Some(Self {
             max_buffer_length: max_buffer_length.map_or(device_limit, |n| n.min(device_limit)),
             max_threads: max_threads_per_threadgroup,
@@ -295,6 +306,11 @@ impl MetalEngine {
             scratch_activation: None,
             scratch_scales: None,
             scratch_outputs: Vec::new(),
+            mlp,
+            constants: HashMap::new(),
+            silu: None,
+            scratch_mlp: mlp::Scratch::default(),
+            command_buffers: std::cell::Cell::new(0),
         }))
     }
 
@@ -334,6 +350,11 @@ impl MetalEngine {
     /// Set the CPU share for subsequent calls without changing their sums.
     pub fn set_options(&mut self, options: MetalOptions) {
         self.cpu_share = options.cpu_share;
+    }
+
+    /// Command buffers committed by this engine so far.
+    pub fn command_buffers(&self) -> u64 {
+        self.command_buffers.get()
     }
 
     /// The CPU share used for subsequent calls.
@@ -785,6 +806,7 @@ impl MetalEngine {
             encode(&encoder);
             encoder.endEncoding();
             command.commit();
+            self.command_buffers.set(self.command_buffers.get() + 1);
             Ok(InFlight(command))
         })
     }
