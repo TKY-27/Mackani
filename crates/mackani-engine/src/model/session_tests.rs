@@ -422,3 +422,153 @@ fn failed_partial_replay_retains_pending_pass_and_full_retry_replays_correctly()
     drop(engine);
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn cpu_stage_attention_pass_matches_scalar_steps_at_published_shape() {
+    use mackani_ref::attention::{Attention, AttentionDimensions};
+    let mut seed = 0x2545_f491_u32;
+    let mut values = |len: usize| {
+        (0..len)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                (seed as i32 as f32) / (i32::MAX as f32) * 3.0
+            })
+            .collect::<Vec<_>>()
+    };
+    let layer = Attention::new(
+        AttentionDimensions {
+            query_heads: 24,
+            kv_heads: 4,
+            head_dim: 256,
+            rotary_dim: 64,
+        },
+        values(256),
+        values(256),
+        1e-6,
+    )
+    .unwrap();
+    for threads in [1, 4] {
+        let mut engine = Compute::new(
+            Engine::new(Kernel::Portable, threads).unwrap(),
+            Backend::Cpu,
+        )
+        .unwrap();
+        engine.cpu_stages = true;
+        let mut state = layer.new_state().unwrap();
+        let mut reference = layer.new_state().unwrap();
+        let mut position = 0;
+        for rows in [1, 8, 16, 1] {
+            let q = (0..rows).map(|_| values(12_288)).collect::<Vec<_>>();
+            let k = (0..rows).map(|_| values(1024)).collect::<Vec<_>>();
+            let v = (0..rows).map(|_| values(1024)).collect::<Vec<_>>();
+            let mut timing = PassTiming {
+                position,
+                ..PassTiming::default()
+            };
+            let actual =
+                attention_pass(&mut engine, &layer, &mut state, [&q, &k, &v], &mut timing).unwrap();
+            for i in 0..rows {
+                let expected = layer
+                    .step(&mut reference, position + i, &q[i], &k[i], &v[i])
+                    .unwrap();
+                assert_eq!(
+                    actual[i].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    "threads={threads} rows={rows} row={i}"
+                );
+            }
+            assert_eq!(state, reference);
+            position += rows;
+        }
+    }
+}
+
+/// Times attention-row preparation (`PassTiming::kv_encode`) at the published
+/// model's attention shape, with the CPU-stage scheduling Apple Silicon uses.
+#[test]
+#[ignore = "timing benchmark: cargo test --release -p mackani-engine attention_preparation_timing -- --ignored --nocapture"]
+fn attention_preparation_timing() {
+    use mackani_ref::attention::{Attention, AttentionDimensions};
+    const LAYERS: f64 = 16.0;
+    const CONTEXT: usize = 1024;
+    const SAMPLES: usize = 400;
+    let mut seed = 0x9e37_79b9_u32;
+    let mut values = |len: usize| {
+        (0..len)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 8) as f32 / (1 << 23) as f32 - 1.0
+            })
+            .collect::<Vec<_>>()
+    };
+    let layer = Attention::new(
+        AttentionDimensions {
+            query_heads: 24,
+            kv_heads: 4,
+            head_dim: 256,
+            rotary_dim: 64,
+        },
+        values(256),
+        values(256),
+        1e-6,
+    )
+    .unwrap();
+    let threads = std::env::var("MACKANI_BENCH_THREADS")
+        .ok()
+        .and_then(|threads| threads.parse().ok())
+        .unwrap_or_else(|| crate::Machine::detect().default_threads());
+    let mut engine = Compute::new(
+        Engine::new(Kernel::fastest(), threads).unwrap(),
+        Backend::Cpu,
+    )
+    .unwrap();
+    engine.cpu_stages = true;
+    let mut prefix = layer.new_state().unwrap();
+    for position in 0..CONTEXT {
+        let prepared = layer
+            .prepare_row(position, &values(12_288), &values(1024), &values(1024))
+            .unwrap();
+        layer
+            .append_prepared(&mut prefix, position, &prepared)
+            .unwrap();
+    }
+    println!("threads={threads} context={CONTEXT} samples={SAMPLES}");
+    println!("| M | median µs/pass | min µs/pass | ms/token (16 layers) | output digest |");
+    for rows in [1, 8, 16] {
+        let q = (0..rows).map(|_| values(12_288)).collect::<Vec<_>>();
+        let k = (0..rows).map(|_| values(1024)).collect::<Vec<_>>();
+        let v = (0..rows).map(|_| values(1024)).collect::<Vec<_>>();
+        let mut digest = 0;
+        let mut samples = (0..SAMPLES + SAMPLES / 4)
+            .map(|_| {
+                let mut state = prefix.clone();
+                let mut timing = PassTiming {
+                    position: CONTEXT,
+                    ..PassTiming::default()
+                };
+                let output =
+                    attention_pass(&mut engine, &layer, &mut state, [&q, &k, &v], &mut timing)
+                        .unwrap();
+                // FNV-1a over the output bits, folded into the cache digest.
+                digest = output
+                    .iter()
+                    .flatten()
+                    .fold(0xcbf2_9ce4_8422_2325_u64, |hash, x| {
+                        (hash ^ u64::from(x.to_bits())).wrapping_mul(0x0100_0000_01b3)
+                    });
+                state.update_digest(&mut digest);
+                timing.kv_encode.as_secs_f64() * 1e6
+            })
+            .skip(SAMPLES / 4)
+            .collect::<Vec<_>>();
+        samples.sort_by(f64::total_cmp);
+        let median = samples[SAMPLES / 2];
+        println!(
+            "| {rows} | {median:.1} | {:.1} | {:.3} | {digest:016x} |",
+            samples[0],
+            median * LAYERS / rows as f64 / 1e3
+        );
+    }
+}

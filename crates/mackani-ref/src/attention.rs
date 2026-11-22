@@ -190,12 +190,54 @@ impl AttentionState {
     }
 }
 
+/// One position's BF16-rounded RoPE cosines and sines, shared by every head at that position.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RopeTable {
+    position: usize,
+    cosines: [f32; FREQUENCY_BITS.len()],
+    sines: [f32; FREQUENCY_BITS.len()],
+}
+
+impl RopeTable {
+    /// Compute the table for one causal position.
+    pub fn new(position: usize) -> Result<Self> {
+        let mut cosines = [0.0; FREQUENCY_BITS.len()];
+        let mut sines = [0.0; FREQUENCY_BITS.len()];
+        for (pair, &frequency) in FREQUENCY_BITS.iter().enumerate() {
+            // These are chapter 04's exact frequency bits, never regenerated from theta.
+            let (cosine, sine) = sincos(position as f32 * f32::from_bits(frequency))?;
+            // The cached cosine/sine are individually rounded to BF16.
+            cosines[pair] = bfloat(cosine);
+            sines[pair] = bfloat(sine);
+        }
+        Ok(Self {
+            position,
+            cosines,
+            sines,
+        })
+    }
+
+    /// The causal position these angles belong to.
+    pub fn position(&self) -> usize {
+        self.position
+    }
+}
+
+/// One query head's rounded rotated query and rounded gate.
+#[derive(Clone)]
+pub struct QueryHead {
+    queries: Vec<f32>,
+    gates: Vec<f32>,
+    // Checked when the row is finished, after its cache sides, as in `prepare_row`.
+    finite_queries: bool,
+    finite_gates: bool,
+}
+
 /// Normalized query heads and encoded KV operands ready for attention.
 pub struct PreparedRow {
     dimensions: AttentionDimensions,
     position: usize,
-    queries: Vec<f32>,
-    gates: Vec<f32>,
+    heads: Vec<QueryHead>,
     cache: CacheToken,
 }
 
@@ -508,7 +550,6 @@ impl Attention {
         let operands = self.head_operands(state, position, prepared, query_head)?;
         let mut output = Vec::with_capacity(self.dimensions.head_dim);
         {
-            let start = query_head * self.dimensions.head_dim;
             let attended = attend(operands)?;
             if attended.len() != self.dimensions.head_dim {
                 return Err(Error::InvalidInput(
@@ -517,7 +558,8 @@ impl Attention {
             }
             let unrotated = inverse_rotate_cache(&attended);
             M::finite(&unrotated, "attention inverse cache rotation")?;
-            let mut gates: [f32; 256] = std::array::from_fn(|i| prepared.gates[start + i]);
+            let mut gates: [f32; 256] =
+                std::array::from_fn(|i| prepared.heads[query_head].gates[i]);
             M::sigmoid(&mut gates);
             M::bfloat(&mut gates);
             for (channel, value) in unrotated.into_iter().enumerate() {
@@ -550,10 +592,9 @@ impl Attention {
                 "invalid attention prefix or head".into(),
             ));
         }
-        let start = query_head * self.dimensions.head_dim;
         let kv_head = query_head / (self.dimensions.query_heads / self.dimensions.kv_heads);
         Ok(AttentionOperands {
-            query: &prepared.queries[start..start + self.dimensions.head_dim],
+            query: &prepared.heads[query_head].queries,
             kv_head,
             prefix: &state.rows[..position],
             current: &prepared.cache,
@@ -588,12 +629,9 @@ impl Attention {
         projected_key: &[f32],
         projected_value: &[f32],
     ) -> Result<PreparedRow> {
-        let mut prepared = self.prepare_query_heads(
-            position,
-            projected_query_gate,
-            projected_key,
-            projected_value,
-        )?;
+        self.validate_projected_rows(projected_query_gate, projected_key, projected_value)?;
+        let rope = RopeTable::new(position)?;
+        let mut prepared = self.prepare_query_heads(&rope, projected_query_gate)?;
         let mut keys = Vec::with_capacity(self.dimensions.kv_heads);
         let mut values = Vec::with_capacity(self.dimensions.kv_heads);
         for head in 0..self.dimensions.kv_heads {
@@ -609,13 +647,12 @@ impl Attention {
                 .map(|&value| bfloat(value))
                 .collect();
             let normalized_key = self.normalize_head(&key, &self.key_norm)?;
-            let rotated_key = rotate_cache(&self.rope(&normalized_key, position)?);
+            let rotated_key = rotate_cache(&self.rope(&normalized_key, &rope)?);
             keys.push(self.encode_row(head, 0, position, &rotated_key)?);
             // Values receive neither head normalization nor RoPE.
             values.push(self.encode_row(head, 1, position, &rotate_cache(&value))?);
         }
-        finite(&prepared.queries, "attention rounded rotated query")?;
-        finite(&prepared.gates, "attention rounded gate")?;
+        finite_queries(&prepared)?;
         prepared.cache = CacheToken { keys, values };
         Ok(prepared)
     }
@@ -628,44 +665,73 @@ impl Attention {
         k: &[f32],
         v: &[f32],
     ) -> Result<PreparedRow> {
-        let prepared = self.prepare_query_heads(position, q, k, v)?;
-        finite(&prepared.queries, "attention rounded rotated query")?;
-        finite(&prepared.gates, "attention rounded gate")?;
+        self.validate_projected_rows(q, k, v)?;
+        let prepared = self.prepare_query_heads(&RopeTable::new(position)?, q)?;
+        finite_queries(&prepared)?;
         Ok(prepared)
     }
 
-    fn prepare_query_heads(
+    /// A single independent query head, preserving the scalar boundaries of `prepare_queries`.
+    pub fn prepare_query_head(
         &self,
-        position: usize,
+        rope: &RopeTable,
+        head: usize,
         q: &[f32],
-        k: &[f32],
-        v: &[f32],
+    ) -> Result<QueryHead> {
+        if head >= self.dimensions.query_heads || q.len() != 2 * self.query_width {
+            return Err(Error::InvalidInput("invalid attention query head".into()));
+        }
+        let start = 2 * head * self.dimensions.head_dim;
+        let projected = &q[start..start + 2 * self.dimensions.head_dim];
+        // Rows validated by `prepare_row` never fail here; engine tasks rely on it.
+        finite(projected, "attention query/gate projection")?;
+        // Each head stores its query followed immediately by that head's raw gate.
+        let (query, gate) = projected.split_at(self.dimensions.head_dim);
+        let query: Vec<f32> = query.iter().map(|&value| bfloat(value)).collect();
+        let normalized = self.normalize_head(&query, &self.query_norm)?;
+        // Only queries have a BF16 boundary after the cache rotation.
+        let queries: Vec<f32> = rotate_cache(&self.rope(&normalized, rope)?)
+            .into_iter()
+            .map(bfloat)
+            .collect();
+        let gates: Vec<f32> = gate.iter().map(|&value| bfloat(value)).collect();
+        Ok(QueryHead {
+            finite_queries: queries.iter().all(|value| value.is_finite()),
+            finite_gates: gates.iter().all(|value| value.is_finite()),
+            queries,
+            gates,
+        })
+    }
+
+    /// Assemble independently prepared query heads, in head order, exactly as `prepare_queries`.
+    /// The row's cache sides validate its key and value projections.
+    pub fn finish_query_heads(
+        &self,
+        rope: &RopeTable,
+        heads: Vec<QueryHead>,
     ) -> Result<PreparedRow> {
-        self.validate_projected_rows(q, k, v)?;
-        let mut queries = Vec::with_capacity(self.query_width);
-        let mut gates = Vec::with_capacity(self.query_width);
-        for head in 0..self.dimensions.query_heads {
-            let start = 2 * head * self.dimensions.head_dim;
-            // Each head stores its query followed immediately by that head's raw gate.
-            let query: Vec<f32> = q[start..start + self.dimensions.head_dim]
-                .iter()
-                .map(|&value| bfloat(value))
-                .collect();
-            let normalized = self.normalize_head(&query, &self.query_norm)?;
-            let rotated = rotate_cache(&self.rope(&normalized, position)?);
-            // Only queries have a BF16 boundary after the cache rotation.
-            queries.extend(rotated.into_iter().map(bfloat));
-            gates.extend(
-                q[start + self.dimensions.head_dim..start + 2 * self.dimensions.head_dim]
-                    .iter()
-                    .map(|&value| bfloat(value)),
-            );
+        let prepared = self.query_row(rope.position, heads)?;
+        finite_queries(&prepared)?;
+        Ok(prepared)
+    }
+
+    fn prepare_query_heads(&self, rope: &RopeTable, q: &[f32]) -> Result<PreparedRow> {
+        let heads = (0..self.dimensions.query_heads)
+            .map(|head| self.prepare_query_head(rope, head, q))
+            .collect::<Result<Vec<_>>>()?;
+        self.query_row(rope.position, heads)
+    }
+
+    fn query_row(&self, position: usize, heads: Vec<QueryHead>) -> Result<PreparedRow> {
+        if heads.len() != self.dimensions.query_heads {
+            return Err(Error::InvalidInput(
+                "invalid attention prepared query heads".into(),
+            ));
         }
         Ok(PreparedRow {
             dimensions: self.dimensions,
             position,
-            queries,
-            gates,
+            heads,
             cache: CacheToken {
                 keys: Vec::new(),
                 values: Vec::new(),
@@ -686,13 +752,19 @@ impl Attention {
         side: usize,
         projected: &[f32],
     ) -> Result<CacheRow> {
-        self.prepare_cache_side_with_search(position, head, side, projected, search_chain)
+        self.prepare_cache_side_with_search(
+            &RopeTable::new(position)?,
+            head,
+            side,
+            projected,
+            search_chain,
+        )
     }
 
     /// Same projection boundaries with an independent integer trellis search.
     pub fn prepare_cache_side_with_search(
         &self,
-        position: usize,
+        rope: &RopeTable,
         head: usize,
         side: usize,
         projected: &[f32],
@@ -716,11 +788,11 @@ impl Attention {
             .map(bfloat)
             .collect();
         let rotated = if side == 0 {
-            rotate_cache(&self.rope(&self.normalize_head(&row, &self.key_norm)?, position)?)
+            rotate_cache(&self.rope(&self.normalize_head(&row, &self.key_norm)?, rope)?)
         } else {
             rotate_cache(&row)
         };
-        self.encode_row_with_search(head, side, position, &rotated, search)
+        self.encode_row_with_search(head, side, rope.position, &rotated, search)
     }
 
     /// Finish an engine-prepared row; sides are interleaved key/value in head order.
@@ -769,16 +841,12 @@ impl Attention {
         Ok(normalized)
     }
 
-    fn rope(&self, normalized: &[f32], position: usize) -> Result<Vec<f32>> {
+    fn rope(&self, normalized: &[f32], rope: &RopeTable) -> Result<Vec<f32>> {
         let mut rotated = normalized.to_vec();
         let pairs = self.dimensions.rotary_dim / 2;
         for pair in 0..pairs {
-            // These are chapter 04's exact frequency bits, never regenerated from theta.
-            let angle = position as f32 * f32::from_bits(FREQUENCY_BITS[pair]);
-            let (cosine, sine) = sincos(angle)?;
-            // The cached cosine/sine and both products are individually rounded to BF16.
-            let cosine = bfloat(cosine);
-            let sine = bfloat(sine);
+            let (cosine, sine) = (rope.cosines[pair], rope.sines[pair]);
+            // Both products are individually rounded to BF16.
             rotated[pair] = bfloat(
                 bfloat(normalized[pair] * cosine) + bfloat(-normalized[pair + pairs] * sine),
             );
@@ -788,6 +856,16 @@ impl Attention {
         finite(&rotated, "attention rotary head")?;
         Ok(rotated)
     }
+}
+
+fn finite_queries(prepared: &PreparedRow) -> Result<()> {
+    if !prepared.heads.iter().all(|head| head.finite_queries) {
+        return Err(Error::NonFinite("attention rounded rotated query"));
+    }
+    if !prepared.heads.iter().all(|head| head.finite_gates) {
+        return Err(Error::NonFinite("attention rounded gate"));
+    }
+    Ok(())
 }
 
 mod reduction;

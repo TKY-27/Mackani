@@ -254,9 +254,14 @@ fn query_projection_keeps_each_heads_gate_interleaved() {
     let prepared = layer
         .prepare_row(0, &query_gate, &[0.0; 512], &[0.0; 512])
         .unwrap();
-    assert!(prepared.gates[..256].iter().all(|&value| value == 0.25));
-    assert!(prepared.gates[256..].iter().all(|&value| value == -0.5));
-    assert!(prepared.queries.iter().all(|&value| value == 0.0));
+    assert!(prepared.heads[0].gates.iter().all(|&value| value == 0.25));
+    assert!(prepared.heads[1].gates.iter().all(|&value| value == -0.5));
+    assert!(
+        prepared
+            .heads
+            .iter()
+            .all(|head| head.queries.iter().all(|&value| value == 0.0))
+    );
 }
 
 #[test]
@@ -385,4 +390,69 @@ fn non_finite_cache_input_is_an_error() {
         encode_int8(&[f32::INFINITY]),
         Err(Error::NonFinite(_))
     ));
+}
+
+#[test]
+fn shared_rope_table_matches_per_head_sincos_and_scalar_rows() {
+    let layer = Attention::new(
+        AttentionDimensions {
+            query_heads: 24,
+            kv_heads: 4,
+            head_dim: 256,
+            rotary_dim: 64,
+        },
+        (0..256).map(|i| i as f32 / 512.0 - 0.25).collect(),
+        (0..256).map(|i| 0.125 - i as f32 / 1024.0).collect(),
+        1.0e-6,
+    )
+    .unwrap();
+    let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    let q: Vec<f32> = (0..12_288)
+        .map(|i| ((i * 37 % 113) as f32 - 56.0) / 17.0)
+        .collect();
+    let k: Vec<f32> = (0..1024)
+        .map(|i| ((i * 53 % 97) as f32 - 48.0) / 13.0)
+        .collect();
+    let v: Vec<f32> = (0..1024)
+        .map(|i| ((i * 29 % 89) as f32 - 44.0) / 11.0)
+        .collect();
+    for position in [0, 1, 2, 33, 4095, 30_000, 262_143, 1 << 24] {
+        let rope = RopeTable::new(position).unwrap();
+        for (pair, &frequency) in FREQUENCY_BITS.iter().enumerate() {
+            // The per-head computation this table replaces.
+            let (cosine, sine) = sincos(position as f32 * f32::from_bits(frequency)).unwrap();
+            assert_eq!(rope.cosines[pair].to_bits(), bfloat(cosine).to_bits());
+            assert_eq!(rope.sines[pair].to_bits(), bfloat(sine).to_bits());
+        }
+        let expected = layer.prepare_row(position, &q, &k, &v).unwrap();
+        let heads = (0..24)
+            .map(|head| layer.prepare_query_head(&rope, head, &q).unwrap())
+            .collect();
+        let queries = layer.finish_query_heads(&rope, heads).unwrap();
+        let standalone = layer.prepare_queries(position, &q, &k, &v).unwrap();
+        for prepared in [&queries, &standalone] {
+            assert_eq!(prepared.position, position);
+            for (actual, expected) in prepared.heads.iter().zip(&expected.heads) {
+                assert_eq!(bits(&actual.queries), bits(&expected.queries));
+                assert_eq!(bits(&actual.gates), bits(&expected.gates));
+            }
+        }
+        // Flattened in head order, the heads keep each query beside its gate.
+        let flat: Vec<f32> = expected
+            .heads
+            .iter()
+            .flat_map(|head| head.queries.iter().chain(&head.gates).copied())
+            .collect();
+        assert_eq!(flat.len(), q.len());
+        for head in 0..4 {
+            assert_eq!(
+                layer.prepare_cache_side(position, head, 0, &k).unwrap(),
+                expected.cache.keys[head]
+            );
+            assert_eq!(
+                layer.prepare_cache_side(position, head, 1, &v).unwrap(),
+                expected.cache.values[head]
+            );
+        }
+    }
 }
