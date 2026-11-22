@@ -147,16 +147,12 @@ fn encode(
 }
 
 impl MetalEngine {
-    /// A tensor's constant buffer, keyed like the lookup tables: the mapping
-    /// stays wrapped (and its address unused) until the engine is dropped, and
-    /// each tensor has its own table offset.
+    /// A tensor's constant buffer, keyed by the tensor itself: tensors may share
+    /// a lookup table but never their row scales or signs. The cache keeps the
+    /// tensor alive, so its address is never reused for another one.
     fn constant(&mut self, matrix: &Matrix, kind: Constant) -> Result<Retained<Buffer>> {
-        let key = (
-            matrix.mapping().as_ptr() as usize,
-            matrix.descriptor().table_offset,
-            kind,
-        );
-        if let Some(buffer) = self.constants.get(&key) {
+        let key = (std::sync::Arc::as_ptr(&matrix.0) as usize, kind);
+        if let Some((_, buffer)) = self.constants.get(&key) {
             return Ok(buffer.clone());
         }
         let signs = |signs: &[i8]| signs.iter().map(|&s| s as u8).collect::<Vec<_>>();
@@ -170,7 +166,7 @@ impl MetalEngine {
             Constant::InputSigns => signs(matrix.input_signs()),
         };
         let buffer = self.shared_buffer(&bytes)?;
-        self.constants.insert(key, buffer.clone());
+        self.constants.insert(key, (matrix.clone(), buffer.clone()));
         Ok(buffer)
     }
 

@@ -225,8 +225,8 @@ pub struct MetalEngine {
     scratch_outputs: Vec<Option<Retained<Buffer>>>,
     /// The fused MLP stages, when the device runs them.
     mlp: Option<mlp::Pipelines>,
-    /// Per-tensor row scales and signs of fused MLP spans, keyed like `tables`.
-    constants: HashMap<(usize, u64, mlp::Constant), Retained<Buffer>>,
+    /// Per-tensor row scales and signs of fused MLP spans.
+    constants: HashMap<(usize, mlp::Constant), (Matrix, Retained<Buffer>)>,
     silu: Option<Retained<Buffer>>,
     scratch_mlp: mlp::Scratch,
     command_buffers: std::cell::Cell<u64>,
