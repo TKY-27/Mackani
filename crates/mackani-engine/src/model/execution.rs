@@ -283,26 +283,51 @@ pub(super) fn attention_pass(
     let start = Instant::now();
     let prepared = if engine.cpu_stages {
         let parallel = (|| {
+            use mackani_ref::attention::RopeTable;
+            enum Task {
+                Side(mackani_ref::kv_codec::CacheRow),
+                Query(mackani_ref::attention::QueryHead),
+            }
+            let ropes = (0..q.len())
+                .map(|row| RopeTable::new(position + row))
+                .collect::<Result<Vec<_>>>()?;
+            // Per row: interleaved key/value sides in head order, then query heads in order.
             let sides_per_row = attention.kv_heads() * 2;
-            let sides = engine.map_range(0..q.len() * sides_per_row, |index| {
-                let row = index / sides_per_row;
-                let side = index % 2;
-                attention.prepare_cache_side_with_search(
-                    position + row,
-                    index % sides_per_row / 2,
-                    side,
-                    if side == 0 { &k[row] } else { &v[row] },
-                    crate::cpu_stages::kv_codec::search_chain,
-                )
+            let tasks_per_row = sides_per_row + attention.query_heads();
+            let tasks = engine.map_range(0..q.len() * tasks_per_row, |index| {
+                let row = index / tasks_per_row;
+                let task = index % tasks_per_row;
+                if task < sides_per_row {
+                    let side = task % 2;
+                    attention
+                        .prepare_cache_side_with_search(
+                            &ropes[row],
+                            task / 2,
+                            side,
+                            if side == 0 { &k[row] } else { &v[row] },
+                            crate::cpu_stages::kv_codec::search_chain,
+                        )
+                        .map(Task::Side)
+                } else {
+                    attention
+                        .prepare_query_head(&ropes[row], task - sides_per_row, &q[row])
+                        .map(Task::Query)
+                }
             })?;
-            let queries = engine.map_range(0..q.len(), |i| {
-                attention.prepare_queries(position + i, &q[i], &k[i], &v[i])
-            })?;
-            let mut sides = sides.into_iter();
-            queries
-                .into_iter()
-                .map(|query| {
-                    attention.finish_prepared(query, sides.by_ref().take(sides_per_row).collect())
+            let mut tasks = tasks.into_iter();
+            ropes
+                .iter()
+                .map(|rope| {
+                    let mut sides = Vec::with_capacity(sides_per_row);
+                    let mut heads = Vec::with_capacity(tasks_per_row - sides_per_row);
+                    for task in tasks.by_ref().take(tasks_per_row) {
+                        match task {
+                            Task::Side(side) => sides.push(side),
+                            Task::Query(head) => heads.push(head),
+                        }
+                    }
+                    let queries = attention.finish_query_heads(rope, heads)?;
+                    attention.finish_prepared(queries, sides)
                 })
                 .collect::<Result<Vec<_>>>()
         })();
