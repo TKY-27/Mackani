@@ -1,6 +1,7 @@
 use crate::{Error, Kernel, Matrix, Result, kernel};
 use std::{
     ops::Range,
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc, OnceLock,
         atomic::{AtomicUsize, Ordering},
@@ -24,6 +25,11 @@ struct KernelJob {
 enum Job {
     Kernel(KernelJob),
     Range(Box<dyn FnOnce() + Send>),
+}
+
+fn catch_range_panic<T>(run: impl FnOnce() -> Result<T>) -> Result<T> {
+    catch_unwind(AssertUnwindSafe(run))
+        .unwrap_or_else(|_| Err(Error::InvalidInput("range worker panicked".into())))
 }
 
 /// Persistent workers. Calls borrow mutably so one engine executes one call at a time.
@@ -107,8 +113,9 @@ impl Engine {
         self.workers.len()
     }
 
-    /// Run independent indices on the same persistent workers, returning index order.
-    /// Each worker owns its results; the caller's closure may borrow immutable data.
+    /// Run independent indices, returning results in index order.
+    /// Single-item ranges run on the caller; larger ranges use persistent workers.
+    /// The closure may borrow immutable data.
     pub fn map_range<T: Send, F: Fn(usize) -> Result<T> + Sync>(
         &mut self,
         range: Range<usize>,
@@ -119,6 +126,17 @@ impl Engine {
         }
         if range.is_empty() {
             return Ok(Vec::new());
+        }
+        if range.len() == 1 {
+            let mut output = Vec::new();
+            output
+                .try_reserve_exact(1)
+                .map_err(|_| Error::InvalidInput("range output allocation failed".into()))?;
+            // Like the worker path, also catch a panic while dropping the panic payload.
+            output.push(catch_range_panic(|| {
+                catch_range_panic(|| function(range.start))
+            })?);
+            return Ok(output);
         }
         let mut output: Vec<Option<T>> = Vec::new();
         output
@@ -137,7 +155,7 @@ impl Engine {
             let length = range.len();
             let first = range.start;
             let run: Box<dyn FnOnce() + Send + '_> = Box::new(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let result = catch_range_panic(|| {
                     let mut results = Vec::new();
                     loop {
                         let offset = next.fetch_add(1, Ordering::Relaxed);
@@ -146,17 +164,11 @@ impl Engine {
                         }
                         let index = first + offset;
                         // Caught per index so a panic is reported at its own index.
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            function(index)
-                        }))
-                        .unwrap_or_else(|_| {
-                            Err(Error::InvalidInput("range worker panicked".into()))
-                        });
+                        let result = catch_range_panic(|| function(index));
                         results.push((index, result));
                     }
-                    results
-                }))
-                .map_err(|_| Error::InvalidInput("range worker panicked".into()));
+                    Ok(results)
+                });
                 let _ = reply.send(result);
             });
             // SAFETY: function and next stay alive until all `sent` jobs reply below,

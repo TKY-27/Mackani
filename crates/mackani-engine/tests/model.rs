@@ -427,6 +427,104 @@ fn persistent_range_pool_preserves_order_borrows_and_recovers_after_errors() {
 }
 
 #[test]
+fn single_item_range_runs_inline_and_preserves_errors() {
+    use mackani_engine::{Error, Result};
+    use std::{panic, thread};
+
+    struct PanicOnDrop;
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            panic!("expected panic from payload destructor");
+        }
+    }
+
+    let mut engine = Engine::new(Kernel::Portable, 4).unwrap();
+    let caller = thread::current().id();
+    let input = [7, 23];
+    let map = |i| {
+        assert_eq!(thread::current().id(), caller);
+        Ok(&input[i])
+    };
+    assert_eq!(engine.map_range(1..2, map).unwrap(), vec![&23]);
+    let error = engine
+        .map_range(1..2, |i| -> Result<()> {
+            Err(Error::InvalidInput(format!("index {i}")))
+        })
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput(message) if message == "index 1"));
+    for fail in [
+        || -> Result<()> { panic!("expected range closure panic") },
+        || -> Result<()> { panic::panic_any(PanicOnDrop) },
+    ] {
+        let error = engine.map_range(1..2, |_| fail()).unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidInput(message) if message == "range worker panicked")
+        );
+    }
+    assert_eq!(engine.map_range(1..2, map).unwrap(), vec![&23]);
+}
+
+#[test]
+#[ignore = "CPU benchmark; run in release mode with --nocapture"]
+fn bench_single_item_pool() {
+    use std::{hint::black_box, time::Instant};
+
+    let mut engine = Engine::new(Kernel::Portable, 4).unwrap();
+    let mut map = || black_box(engine.map_range(black_box(0..1), |i| Ok(i + 1)).unwrap());
+    for _ in 0..1_000 {
+        map();
+    }
+    let iterations = 20_000;
+    let started = Instant::now();
+    for _ in 0..iterations {
+        map();
+    }
+    println!(
+        "map_ns_per_call={:.2}",
+        started.elapsed().as_secs_f64() * 1e9 / f64::from(iterations)
+    );
+
+    let fixture = Fixture::new(&support::synthetic_model(
+        19,
+        &[
+            "linear_attention",
+            "full_attention",
+            "linear_attention",
+            "full_attention",
+        ],
+    ));
+    let mut reference = mackani_ref::Model::load_folder(&fixture.0).unwrap();
+    let mut model = fixture.model(Kernel::Portable, 4, 8);
+    let prefix: Vec<_> = (0..8).map(|i| i * 7 + 11).collect();
+    let suffix: Vec<_> = (8..16).map(|i| (i * 7 + 11) % 128).collect();
+    model.prefill(&prefix).unwrap();
+    reference.prefill(&prefix).unwrap();
+    let checkpoint = model.snapshot().unwrap();
+    let ref_checkpoint = reference.snapshot().unwrap();
+    for rows in [1, 8] {
+        let tokens = &suffix[..rows];
+        reference.restore(&ref_checkpoint).unwrap();
+        reference.prefill(tokens).unwrap();
+        let mut elapsed = Vec::new();
+        for _ in 0..86 {
+            model.restore(&checkpoint).unwrap();
+            let started = Instant::now();
+            model.prefill(tokens).unwrap();
+            elapsed.push(started.elapsed());
+            same(model.row_logits(), reference.row_logits(), "logits");
+            assert_eq!(model.state_digest(), reference.state_digest());
+        }
+        let samples = &mut elapsed[5..]; // Discard warm-up passes.
+        samples.sort_unstable();
+        println!(
+            "rows={rows} pass_median_us={:.2} digest={}",
+            samples[samples.len() / 2].as_secs_f64() * 1e6,
+            digest(model.row_logits()),
+        );
+    }
+}
+
+#[test]
 fn default_and_explicit_constructors_keep_int8() {
     let fixture = Fixture::new(&support::synthetic_model(
         107,
